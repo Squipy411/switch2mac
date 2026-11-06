@@ -14,6 +14,10 @@ switch2mac is a fork of [nxnative](https://github.com/seedds/nxnative), carried 
 
 > This repository holds no game content. You need a dump of a game you own; what the build makes from it must not be shared. See [LEGAL.md](LEGAL.md).
 
+## Switch Mac library
+
+The [Switch Mac launcher](launcher/README.md) provides a native library, per-game settings, save backups, and a guided build with separate workspace and app destinations. Finished game apps launch directly from Finder on compatible Apple silicon Macs.
+
 ## What you get (Mario Kart World)
 
 `Mario Kart World.app`: a normal, double-clickable Mac app that carries everything it needs (it keeps working after you delete the build folder).

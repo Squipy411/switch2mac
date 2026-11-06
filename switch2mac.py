@@ -90,15 +90,49 @@ def check_version(tid, bid):
              f'This version is UNTESTED: its build line (game.tsv) and module list must be added first (see {GAMES[tid]["dir"].relative_to(ROOT)}/README.md, "Other versions").')
 
 
-def stage(romfs, out):   # a symlink tree of the RomFS without the dump tool's dot-files, so they never end up in the image
-    if out.exists(): shutil.rmtree(out)
-    n = 0
-    for root, _, files in os.walk(romfs):
-        rel = Path(root).relative_to(romfs); (out / rel).mkdir(parents=True, exist_ok=True)
-        for f in files:
-            if f in SKIP: continue
-            os.symlink(Path(root) / f, out / rel / f); n += 1
-    print(f'  {n:,} game files linked')
+def stage(romfs, out):
+    """Keep the staging tree stable so an unchanged RomFS image can be reused."""
+    romfs = romfs.resolve(strict=True)
+    if out.is_symlink() or out.resolve().is_relative_to(romfs) or romfs.is_relative_to(out.resolve()):
+        raise ValueError('RomFS source and staging folders must be separate.')
+    out.mkdir(parents=True, exist_ok=True)
+    count = changed = 0
+
+    def remove(path):
+        if path.is_dir() and not path.is_symlink():
+            shutil.rmtree(path)
+        else:
+            path.unlink()
+
+    def walk_error(error):
+        raise error
+
+    for root, directories, files in os.walk(romfs, onerror=walk_error):
+        source = Path(root)
+        dest = out / source.relative_to(romfs)
+        directories[:] = [name for name in directories if not (source / name).is_symlink()]
+        files = [name for name in files if name not in SKIP]
+        keep = set(directories).union(files)
+        for old in dest.iterdir():
+            if old.name not in keep:
+                remove(old)
+                changed += 1
+        for name in directories:
+            folder = dest / name
+            if folder.is_symlink() or (folder.exists() and not folder.is_dir()):
+                remove(folder)
+                changed += 1
+            folder.mkdir(exist_ok=True)
+        for name in files:
+            link = dest / name
+            target = source / name
+            if not (link.is_symlink() and os.readlink(link) == str(target)):
+                if link.is_symlink() or link.exists():
+                    remove(link)
+                link.symlink_to(target)
+                changed += 1
+            count += 1
+    print(f'  {count:,} game files linked ({changed:,} staging entries changed)')
 
 
 def paths(a):
@@ -173,6 +207,7 @@ def host_and_app(a, tid, w, lib, e):
     app = w / f'{g["name"]}.app'
     run([py(), NX / 'dm/mac/pack_app.py', app, '--host', NX / 'dm/host/dmhost', '--patched', w / 'build/patched', '--romfs', w / 'extract/RomFS.img',
          '--msl', lib, '--tables', prof, '--font', font, '--env-file', g['dir'] / 'env.txt', '--settings', w / 'build/launcher.json', '--launcher-window', 'off',
+         '--portable-bootstrap', ROOT / 'tools/portable_game.py',
          '--title-id', tid, '--name', g['name'], '--version', g['version'], '--lang', 'en-US', '--marker', g['marker']], env=e)
     (w / 'title.txt').write_text(tid)
     print(f'\ndone: {app}\nnext: ./switch2mac.py install')

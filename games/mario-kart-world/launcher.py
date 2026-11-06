@@ -14,9 +14,9 @@ overlay = {'env': 'DM_OVERLAY', 'kind': 'choice', 'section': 'Game', 'label': 'P
            'default': 'compact', 'level': 'basic', 'options': [['compact', 'Compact'], ['detailed', 'Detailed'], ['off', 'Off']]}
 enc = rows['DM_NVN_ENC_THREAD']
 enc.update(default='1', note='Encodes GPU work on its own thread. Off: about 10 fps slower.')
-perf = {'env': 'DM_NVN_SKIP_FS', 'kind': 'toggle', 'section': 'Performance', 'label': 'Performance mode',
-        'note': 'Skips one environment-reflection update (about +7 fps, near 60). Off: every reflection updated each frame.',
-        'default': '83ea368cd702b9de', 'level': 'basic', 'on': '83ea368cd702b9de', 'off': 'none'}
+perf = {'env': 'DM_RT', 'kind': 'choice', 'section': 'Performance', 'label': 'CPU scheduling',
+        'note': 'Interactive scheduling reduced render submission time on the tested M2 Air.',
+        'default': '0', 'level': 'advanced', 'options': [['0', 'Interactive'], ['1', 'Real time']]}
 order = []
 for s in d['settings']:
     if s['env'] == 'DM_METAL_HUD': continue

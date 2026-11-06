@@ -1,0 +1,1003 @@
+diff --git a/dm/gfx/nvn/hle_nvn.c b/dm/gfx/nvn/hle_nvn.c
+index 904fbec2..9e11843a 100644
+--- a/dm/gfx/nvn/hle_nvn.c
++++ b/dm/gfx/nvn/hle_nvn.c
+@@ -1861,6 +1861,15 @@ static uint64_t present_period(const win_t *o) {
+ // cores within 10 frames of a step to 30), where 60 fps no longer fits and every trial back to it fails. A step the game fixes itself (BotW's VFR override) is declared as it is
+ static uint64_t rt_period_ns(const win_t *o, uint64_t period) {
+     int c = fps_step_cap();
++    static int stable = -1;
++    if (stable < 0) {
++        const char *value = getenv("DM_RT_PERIOD_STABLE");
++        stable = value && !strcmp(value, "1");
++    }
++    // A one-frame native interval change still paces that frame as requested.
++    // Keep the scheduler at the display link's deadline until it also changes.
++    if (stable && g_hz == 60 && !g_display_mode && !dm_fps_state &&
++        o->interval == 2 && !fps_present_cap() && nvn_game_fps() == 60) return 1000000000ull / 60;
+     if (!period || !c || !fstep_on() || (dm_fps_state && __atomic_load_n((uint32_t *)(dm_fps_state + 0x24), __ATOMIC_RELAXED))) return period;
+     int kmin = fstep_hz() / c;
+     return present_itv(o) > kmin ? (uint64_t)kmin * 1000000000ull / (uint64_t)g_hz : period;
+diff --git a/dm/gfx/nvn/nvn_geometry.inc b/dm/gfx/nvn/nvn_geometry.inc
+index 839c30a1..0d40cf35 100644
+--- a/dm/gfx/nvn/nvn_geometry.inc
++++ b/dm/gfx/nvn/nvn_geometry.inc
+@@ -550,32 +550,43 @@ static void geo_mesh_encode(id<MTLRenderCommandEncoder> en_) {
+ // pixel stage alone, a program of its own as a geometry draw's raster stage is, so it takes the render pass and the pixel stage's state like any draw; mtk_pso gives its pipeline and
+ // mtk_encode binds the two stages and draws. The mesh stage shares the vertex stage's table, as geo_mesh_encode's does, and a task shader has the object stage's; both read the
+ // draw's first workgroup at buffer 29. A pipeline is built in the background and its draws are left out until it is ready, as for a geometry mesh pipeline
+-static struct { int on, miss; NvShader *ts, *ms; uint32_t first, count; } g_mtk;
++static struct {
++    int on, miss;
++    __unsafe_unretained NvProg *program;
++    NvShader *ts, *ms;
++    uint32_t first, count;
++} g_mtk;
+ static void draw_(const p_draw *dw, const p_draw_idx *di);
+ static uint64_t g_mtk_n, g_mtk_wait;
+-static nvn_hmap g_pso_mtk = {.klen = sizeof(pso_key)}; static os_unfair_lock g_pso_mtk_lock = OS_UNFAIR_LOCK_INIT;
++typedef struct { pso_key raster; const void *task; uint64_t amplified; } mtk_key;
++static nvn_hmap g_pso_mtk = {.klen = sizeof(mtk_key)}; static os_unfair_lock g_pso_mtk_lock = OS_UNFAIR_LOCK_INIT;
+ static NSObject *g_pso_mtk_building;
+-static id<MTLRenderPipelineState> mtk_pso(NvProg *raster) {
++static id<MTLRenderPipelineState> mtk_pso(NvProg *raster, int amplified) {
+     NvShader *ts = g_mtk.ts, *ms = g_mtk.ms, *fs = raster->sh[1];
+-    pso_key k; pso_key_fill(&k, ms, fs, g_pass.cfmt, g_pass.dfmt, g_pass.sfmt, g_pass.samples, 0);
+-    memset(k.attr, 0, sizeof k.attr); memset(k.attr_hi, 0, sizeof k.attr_hi); memset(k.stream, 0, sizeof k.stream);
+-    k.fsfn = (__bridge void *)(ts ? ts->fn : ms->fn);   // with ms in the key's vertex place: the task shader is the third of the pipeline's functions
++    mtk_key k = {0};
++    pso_key_fill(&k.raster, ms, fs, g_pass.cfmt, g_pass.dfmt, g_pass.sfmt, g_pass.samples, 0);
++    memset(k.raster.attr, 0, sizeof k.raster.attr);
++    memset(k.raster.attr_hi, 0, sizeof k.raster.attr_hi);
++    memset(k.raster.stream, 0, sizeof k.raster.stream);
++    k.task = (__bridge const void *)(ts ? ts->fn : nil);
++    k.amplified = amplified;
+     os_unfair_lock_lock(&g_pso_mtk_lock); id ps = hm_get_id(&g_pso_mtk, &k);
+     if (!ps) { if (!g_pso_mtk_building) g_pso_mtk_building = [NSObject new]; hm_put_id(&g_pso_mtk, &k, g_pso_mtk_building); }
+     os_unfair_lock_unlock(&g_pso_mtk_lock);
+     if (ps) return ps == NSNull.null || ps == g_pso_mtk_building ? nil : ps;
+-    MTLRenderPipelineDescriptor *d = pso_desc(&k, ms, fs, nil, 0);
++    MTLRenderPipelineDescriptor *d = pso_desc(&k.raster, nil, fs, nil, 0);
+     MTLMeshRenderPipelineDescriptor *m = [MTLMeshRenderPipelineDescriptor new];
++    if (amplified) m.maxVertexAmplificationCount = 2;
+     m.meshFunction = ms->fn; m.fragmentFunction = d.fragmentFunction; m.maxTotalThreadsPerMeshThreadgroup = ms->mesh_threads;
+     if (ts) { m.objectFunction = ts->fn; m.payloadMemoryLength = (ts->mesh_payload + 15u) & ~15u; m.maxTotalThreadsPerObjectThreadgroup = ts->mesh_threads; }
+     m.rasterSampleCount = d.rasterSampleCount; m.alphaToCoverageEnabled = d.alphaToCoverageEnabled;
+     for (int i = 0; i < 8; i++) m.colorAttachments[i] = d.colorAttachments[i];
+     m.depthAttachmentPixelFormat = d.depthAttachmentPixelFormat; m.stencilAttachmentPixelFormat = d.stencilAttachmentPixelFormat;
+-    const char *tk = ts ? ts->key : "-", *mk = ms->key, *fk = fs ? fs->key : "-"; pso_key kk = k;
++    const char *tk = ts ? ts->key : "-", *mk = ms->key, *fk = fs ? fs->key : "-"; mtk_key kk = k;
+     dispatch_async(pp_bg_queue(), ^{
+         NSError *e = nil; uint64_t t0 = bp_now();
+         id<MTLRenderPipelineState> p = [g_dev newRenderPipelineStateWithMeshDescriptor:m options:MTLPipelineOptionNone reflection:nil error:&e];
+-        MLOG("%stask / mesh pipeline: task %s mesh %s fragment %s, %.1f ms in the background%s%s", p ? "" : "[RED] ", tk, mk, fk, (bp_now() - t0) / 1e6, p ? "" : ": ", p ? "" : e.localizedDescription.UTF8String);
++        MLOG("%stask / mesh%s pipeline: task %s mesh %s fragment %s, %.1f ms in the background%s%s", p ? "" : "[RED] ", amplified ? " amplified" : "", tk, mk, fk, (bp_now() - t0) / 1e6, p ? "" : ": ", p ? "" : e.localizedDescription.UTF8String);
+         os_unfair_lock_lock(&g_pso_mtk_lock); hm_put_id(&g_pso_mtk, &kk, p ?: NSNull.null); os_unfair_lock_unlock(&g_pso_mtk_lock);
+     });
+     return nil;
+@@ -601,11 +612,11 @@ static void mesh_tasks_draw(const p_draw *dw) {
+     if (g_nubd && (g_enc || ubd_lazy()) && ((ts && ubd_conflict_sh(ts, 3)) || ubd_conflict_sh(ms, 4))) { g_ubd_conflicts++; rp_end(); ubd_land(); }   // as draw_ does for its stages
+     NvProg *raster = pr->geo_lean_raster;   // the pixel stage alone
+     if (!raster || raster->sh[1] != pr->sh[1] || raster->sh[0]) { raster = [NvProg new]; raster->sh[1] = pr->sh[1]; pr->geo_lean_raster = raster; }
+-    g_mtk.on = 1; g_mtk.miss = 0; g_mtk.ts = ts; g_mtk.ms = ms; g_mtk.first = (uint32_t)dw->first; g_mtk.count = (uint32_t)dw->count;
++    g_mtk.on = 1; g_mtk.miss = 0; g_mtk.program = pr; g_mtk.ts = ts; g_mtk.ms = ms; g_mtk.first = (uint32_t)dw->first; g_mtk.count = (uint32_t)dw->count;
+     g_geo_program = raster;
+     p_draw triangle = {.prim = 4, .count = 3, .instances = 1};
+     draw_(&triangle, NULL);
+-    g_geo_program = nil; g_mtk.on = 0; args_dirty_all();
++    g_geo_program = nil; g_mtk.on = 0; g_mtk.program = nil; args_dirty_all();
+     if (g_mtk.miss) { g_mtk_wait++; return; }
+     swrite_note(pr); g_wr_epoch++;
+     if (!g_mtk_n++) MLOG("task / mesh: first draw, task %s mesh %s fragment %s, %u workgroups from %u", ts ? ts->key : "-", ms->key, pr->sh[1] ? pr->sh[1]->key : "-", g_mtk.count, g_mtk.first);
+diff --git a/dm/gfx/nvn/nvn_mtl.m b/dm/gfx/nvn/nvn_mtl.m
+index f73da6da..b5a59862 100644
+--- a/dm/gfx/nvn/nvn_mtl.m
++++ b/dm/gfx/nvn/nvn_mtl.m
+@@ -3451,11 +3451,11 @@ void mtl_mem_stat(unsigned long long frame, unsigned long long rss_mb) {
+     snprintf(avail, sizeof avail, "%llu MB", (unsigned long long)(os_proc_available_memory() >> 20));
+ #endif
+     MLOG("memory up to frame %llu: resident %llu MB, GPU allocated %llu MB, deferred-release queue %lu, residency set %lu, serial objects %u, memory pools %d (resident %d; peak %d / tracking table capacity %d; freed but alive %lu, %llu MB), shared textures %u (%u of them unreferenced; evicted with pools %llu, on storage takeover %llu in total), texture re-uploads %llu in total, per-frame arena blocks created %llu in total, finalized textures still referenced %u (small table, %llu put in total); headroom to the system memory limit %s", frame, rss_mb, gpu, nd, nr, ns, live, pres, peak, cap, dead_n, dead_mb, ashared, aorph, (unsigned long long)g_alias_evicted, (unsigned long long)g_alias_taken, (unsigned long long)g_pkg_reuploads, (unsigned long long)g_arena_made, nghost, (unsigned long long)ghost_puts, avail);
+-    { void mtl_vc_stats(unsigned *, uint64_t *, uint64_t *), mtl_tb2_stats(uint64_t *, uint64_t *, uint64_t *, uint64_t *, uint64_t *); uint64_t mtl_tex_mis_count(void); unsigned vn; uint64_t vh, vm, tb, tm, tf, tc, tcb;
+-      mtl_vc_stats(&vn, &vh, &vm); mtl_tb2_stats(&tb, &tm, &tf, &tc, &tcb);
++    { void mtl_vc_stats(unsigned *, uint64_t *, uint64_t *, uint64_t *), mtl_tb2_stats(uint64_t *, uint64_t *, uint64_t *, uint64_t *, uint64_t *); uint64_t mtl_tex_mis_count(void); unsigned vn; uint64_t vh, vm, vi, tb, tm, tf, tc, tcb;
++      mtl_vc_stats(&vn, &vh, &vm, &vi); mtl_tb2_stats(&tb, &tm, &tf, &tc, &tcb);
+       MLOG("texture views by texture (vc_get): %u textures hold cached views; %llu views reused, %llu made in total; texture buffers bound as 2D rows for wrapped 1D fetches %llu times, %llu made, %llu failed, %llu copied into aligned rows (%llu MB) "
+-           "(tbuf_as_2d); texture type mismatches no view bridges %llu in total (tex_mis_note)",
+-           vn, (unsigned long long)vh, (unsigned long long)vm, (unsigned long long)tb, (unsigned long long)tm, (unsigned long long)tf, (unsigned long long)tc, (unsigned long long)(tcb >> 20), (unsigned long long)mtl_tex_mis_count()); }
++           "(tbuf_as_2d); texture type mismatches no view bridges %llu in total (tex_mis_note); %llu identity views avoided",
++           vn, (unsigned long long)vh, (unsigned long long)vm, (unsigned long long)tb, (unsigned long long)tm, (unsigned long long)tf, (unsigned long long)tc, (unsigned long long)(tcb >> 20), (unsigned long long)mtl_tex_mis_count(), (unsigned long long)vi); }
+     if (g_allocprof > 0) { char ab[256]; int o = 0; for (int i = 0; i < g_alloc_n && o < 200; i++) o += snprintf(ab + o, sizeof ab - o, " #%d %llu MB", i, (unsigned long long)(g_alloc4[i].allocatedSize >> 20));
+         for (int i = 0; i < 3 && o < 240; i++) o += snprintf(ab + o, sizeof ab - o, " up%d %llu pres%d %llu", i, (unsigned long long)(g_up_alloc4[i].allocatedSize >> 20), i, (unsigned long long)(g_present_alloc4[i].allocatedSize >> 20));
+         MLOG("command allocator usage:%s", ab);
+@@ -3530,6 +3530,7 @@ void zskip_test_add(const char *key, int ubo_slot, int vec, int comp) {
+ // amplification view mapping (count 1, renderTargetArrayIndexOffset), which needs pipelines built with maxVertexAmplificationCount 2 (sm_amp_get; a pipeline with the default 1 ignores
+ // the mapping and every draw lands in the first layer). On Apple GPUs a render pass costs about 35-40 us whatever it draws (M2 Max): Breath of the Wild filters its environment cube map
+ // every tenth frame in 132 one-draw passes, 22 levels of 6 faces, and that frame's GPU time grew by about 5 ms
++enum { SM_RASTER = 1, SM_NATIVE_MESH };
+ static struct { int on, lo, hi; } g_sm_plan;   // set by draw() for the pass rp_begin_ex is about to open
+ static int g_sm_pass, g_sm_lo, g_sm_hi, g_sm_cur, g_sm_applied;   // the open pass is slice-merged: its attachment holds layers lo..hi; cur: the layer the game's target names now; applied: the offset set on the encoder (-1 none)
+ static uint64_t g_sm_npass, g_sm_ncont, g_sm_nwait;   // slice-merged passes, layer switches taken into them, draws that left one because their pipeline was not built yet
+@@ -4076,6 +4077,7 @@ static void attach(MTLRenderPassAttachmentDescriptor *a, const tex_t *t, const v
+ // (Mac character select screen: the color-clear pass drags along a 400x225 depth load and store)
+ static id<MTL4RenderCommandEncoder> rp_begin_ex(int clear_only);
+ static NSUInteger g_rp_aw; static int g_rp_whole;
++static unsigned g_lc_clear_layers;   // consecutive single-slice clears combined by lc_land
+ static id<MTL4RenderCommandEncoder> rp_begin(void) { if (g_enc && g_rp_aw) rp_end(); g_rp_whole = 1; id<MTL4RenderCommandEncoder> e = rp_begin_ex(0); g_rp_whole = 0; return e; }   // the callers draw anywhere in the target (see g_rp_aw)
+ static id<MTL4RenderCommandEncoder> rp_begin_ex_(int clear_only);
+ static id<MTL4RenderCommandEncoder> rp_begin_ex(int clear_only) { AP_B; id<MTL4RenderCommandEncoder> e = rp_begin_ex_(clear_only); AP_E(1); return e; }
+@@ -4121,13 +4123,21 @@ static void attach(MTLRenderPassAttachmentDescriptor *a, const tex_t *t, const v
+         pd.colorAttachments[i].storeAction = MTLStoreActionStore;
+         rt_mirror_add(R.rt.color[i], pd.colorAttachments[i].texture, pd.colorAttachments[i].level, pd.colorAttachments[i].slice, i);
+     }
++    if (clear_only == 1 && g_lc_clear_layers > 1) pd.renderTargetArrayLength = g_lc_clear_layers;
+     if (g_sm_plan.on && !clear_only && pd.colorAttachments[0].texture && !R.rt.depth) {   // slice-merged pass (see g_sm_plan): the attachment holds every layer the draws reach
+         MTLRenderPassColorAttachmentDescriptor *c = pd.colorAttachments[0];
+         g_sm_cur = (int)c.slice; c.slice = (NSUInteger)g_sm_plan.lo; if (c.loadAction == MTLLoadActionDontCare) c.loadAction = MTLLoadActionLoad;   // the other layers' content stays
+         pd.renderTargetArrayLength = (NSUInteger)(g_sm_plan.hi - g_sm_plan.lo + 1);
+-        g_sm_pass = 1; g_sm_lo = g_sm_plan.lo; g_sm_hi = g_sm_plan.hi; g_sm_applied = -1; g_sm_npass++;
++        g_sm_pass = g_sm_plan.on; g_sm_lo = g_sm_plan.lo; g_sm_hi = g_sm_plan.hi; g_sm_applied = -1; g_sm_npass++;
+         static int once; if (!once++) MLOG("slice-merged pass: draws into layers %d-%d of one texture level run as one layered pass (first case pass %llu; DM_NVN_SLICE_MERGE)", g_sm_lo, g_sm_hi, g_stat_pass + 1);
+-        PD("L %llu slice-merged pass: layers %d-%d, first draw into layer %d", g_stat_pass + 1, g_sm_lo, g_sm_hi, g_sm_cur);
++        if (g_sm_pass == SM_NATIVE_MESH) {
++            static int logged_mesh;
++            if (!logged_mesh) {
++                logged_mesh = 1;
++                MLOG("WaterSurface mesh slice merge: first case pass %llu", g_stat_pass + 1);
++            }
++        }
++        PD("L %llu slice-merged pass: layers %d-%d, first draw into layer %d%s", g_stat_pass + 1, g_sm_lo, g_sm_hi, g_sm_cur, g_sm_pass == SM_NATIVE_MESH ? " (WaterSurface native mesh)" : "");
+     }
+     // clear_only: 0 attach all 1 only for clears 2 neither depth nor stencil attached 3 stencil only 4 depth only (3 / 4: the pass_ds_need lookahead proves the whole pass uses only that one)
+     if (R.rt.depth && clear_only != 2 && !(clear_only == 1 && !R.clear_d && !R.clear_s)) {
+@@ -4217,7 +4227,7 @@ static void attach(MTLRenderPassAttachmentDescriptor *a, const tex_t *t, const v
+     for (int i = 0; i < R.rt.n; i++) {
+         MTLRenderPassColorAttachmentDescriptor *c = pd.colorAttachments[i];
+         if (!c.texture) continue;
+-        uint64_t b = att_bytes(c.texture, c.level); natt++; g_bw_store += b; if (c.loadAction == MTLLoadActionLoad) { g_bw_load += b; nload++; }
++        uint64_t b = att_bytes(c.texture, c.level); natt++; g_bw_store += b * (g_lc_clear_layers ? g_lc_clear_layers : 1); if (c.loadAction == MTLLoadActionLoad) { g_bw_load += b; nload++; }
+         if (R.rt.has_cview[i] && R.rt.cview[i].set_format) PD("V %llu c%d view format %#x (base texture NVN format %#x)", g_stat_pass + 1, i, R.rt.cview[i].format, R.rt.color[i]->d.format);
+         PD("P %llu c%d ser=%llu fmt=%lu %lux%lu ms%lu lv%lu sl%lu %s mtl=%p", g_stat_pass + 1, i, R.rt.color[i]->serial, (unsigned long)c.texture.pixelFormat,
+            (unsigned long)c.texture.width, (unsigned long)c.texture.height, (unsigned long)c.texture.sampleCount, (unsigned long)c.level, (unsigned long)c.slice,
+@@ -4973,7 +4983,15 @@ static void treg_finish_submission(void) {
+ typedef struct { const void *pool; unsigned next; vc_key k[VC_WAYS]; void *view[VC_WAYS];   // view: retained
+                  void *rows, *rows_of; uint64_t rows_rid, rows_n; } vc_set;   // rows: a texture buffer as 2D rows (tbuf_as_2d; retained, resident), rows_of / rows_n: the buffer texture it was made from and its element count
+ static nvn_hmap g_vc = {.klen = 8};   // texture serial → vc_set
+-static uint64_t g_vc_hit, g_vc_new;
++static uint64_t g_vc_hit, g_vc_new, g_vc_identity;
++static int vc_identity_on(void) {   // called under g_rmu
++    static int on = -1;
++    if (on < 0) {
++        const char *value = getenv("DM_NVN_IDENTITY_VIEWS");
++        on = value && !strcmp(value, "1");
++    }
++    return on;
++}
+ static void vc_rows_drop(vc_set *s) { if (s->rows) { defer_obj_release((__bridge id)s->rows); CFRelease(s->rows); s->rows = s->rows_of = NULL; s->rows_rid = s->rows_n = 0; } }
+ static void vc_set_free(void *p) {
+     vc_set *s = p;
+@@ -5008,7 +5026,7 @@ static void vc_put(uint64_t ser, const void *pool, const vc_key *k, id<MTLTextur
+     s->k[i] = *k; s->view[i] = (void *)CFBridgingRetain(v); g_vc_new++;
+ }
+ void mtl_vc_drop(uint64_t ser) { os_unfair_lock_lock(&g_rmu); vc_set *s = nvn_hm_del(&g_vc, &ser); if (s) vc_set_free(s); os_unfair_lock_unlock(&g_rmu); }
+-void mtl_vc_stats(unsigned *n, uint64_t *hit, uint64_t *made) { os_unfair_lock_lock(&g_rmu); *n = g_vc.n; *hit = g_vc_hit; *made = g_vc_new; os_unfair_lock_unlock(&g_rmu); }
++void mtl_vc_stats(unsigned *n, uint64_t *hit, uint64_t *made, uint64_t *identity) { os_unfair_lock_lock(&g_rmu); *n = g_vc.n; *hit = g_vc_hit; *made = g_vc_new; *identity = g_vc_identity; os_unfair_lock_unlock(&g_rmu); }
+ static void tb2_gone_clear(void);
+ static void vc_drop_pool(const void *pool) {   // caller holds g_rmu
+     tb2_gone_clear();
+@@ -5296,7 +5314,18 @@ static void treg_pkg_stamp(treg_t *rp, id<MTLTexture> base) {
+             if (fits) { s0 *= 6; ns *= 6; } else tt = MTLTextureType2DArray;
+         }
+         vc_key k; memset(&k, 0, sizeof k); k.pf = pf; k.tt = (uint8_t)tt; k.l0 = (uint32_t)l0; k.nl = (uint32_t)nl; k.s0 = (uint32_t)s0; k.ns = (uint32_t)ns; memcpy(k.sw, sw, 4);
+-        if (!(v = vc_get(rp->t.serial, &k, base))) {
++        // A full-range 2D view with the base format and identity swizzle is equivalent to the base texture.
++        int identity = 0;
++        if (vc_identity_on() && !need_sw && !r.v.set_dsmode && tt == MTLTextureType2D &&
++            tt == base.textureType && pf == base.pixelFormat && l0 == 0 && nl == base.mipmapLevelCount &&
++            s0 == 0 && ns == 1) {
++            MTLTextureSwizzleChannels channels = base.swizzle;
++            identity = channels.red == MTLTextureSwizzleRed && channels.green == MTLTextureSwizzleGreen &&
++                       channels.blue == MTLTextureSwizzleBlue && channels.alpha == MTLTextureSwizzleAlpha;
++        }
++        if (identity) {
++            g_vc_identity++;
++        } else if (!(v = vc_get(rp->t.serial, &k, base))) {
+             v = need_sw ? [base newTextureViewWithPixelFormat:(MTLPixelFormat)pf textureType:tt levels:NSMakeRange(l0, nl) slices:NSMakeRange(s0, ns) swizzle:MTLTextureSwizzleChannelsMake(sw[0], sw[1], sw[2], sw[3])]
+                         : [base newTextureViewWithPixelFormat:(MTLPixelFormat)pf textureType:tt levels:NSMakeRange(l0, nl) slices:NSMakeRange(s0, ns)];
+             if (!v) { RED_ONCE(11, "cannot create texture view id %d", tid); v = base; }
+@@ -5483,6 +5512,22 @@ static MTLSamplerAddressMode wrapm(int w) {
+     d.lodMinClamp = p.lod_min < 0 ? 0 : p.lod_min; d.lodMaxClamp = p.lod_max;
+     d.lodBias = p.lod_bias < -16 ? -16 : p.lod_bias > 15.99f ? 15.99f : p.lod_bias;   // SetLodBias: Maxwell's sampler bias, Metal 26's range [-16, 15.99]
+     d.maxAnisotropy = p.aniso < 1 ? 1 : p.aniso > 16 ? 16 : (NSUInteger)p.aniso;
++    static int low_texture_filtering;
++    static dispatch_once_t texture_filtering_initialized;
++    dispatch_once(&texture_filtering_initialized, ^{
++        const char *setting = getenv("DM_NVN_LOW_TEXTURE_FILTERING");
++        low_texture_filtering = setting && !strcmp(setting, "1");
++    });
++    // Keep depth comparison and min/max reduction samplers intact.
++    if (low_texture_filtering && !p.cmp_mode && !p.reduction && d.maxAnisotropy > 1) {
++        static _Atomic unsigned capped;
++        if (atomic_fetch_add_explicit(&capped, 1, memory_order_relaxed) < 8)
++            MLOG("low texture filtering: capped sampler anisotropy from %lu to 1",
++                 (unsigned long)d.maxAnisotropy);
++        d.maxAnisotropy = 1;
++        if (d.mipFilter != MTLSamplerMipFilterNotMipmapped)
++            d.lodBias = fminf(d.lodBias + 1.0f, 15.99f);
++    }
+     if (p.cmp_mode) d.compareFunction = (MTLCompareFunction)(p.cmp_func - 1);
+     // Reduction (NVN 1 min / 2 max): the minimum or maximum of the texels a filtered sample covers, per channel (Metal 26). Pokémon Legends: Z-A builds its depth pyramid with a min sampler
+     // (151607c7a92386cc reads the level above at an explicit LOD) and tests occlusion boxes against it; averaged, the pyramid is nearer than the scene at depth edges. Metal ignores the reduction
+@@ -6450,7 +6495,7 @@ static void lo_bind(id<MTLCommandEncoder> en) {
+ #define PSO_WHOLE @"built whole"   // pso_desc's label for pso_build_ex: no base, see there
+ static MTLRenderPipelineDescriptor *pso_desc(const pso_key *k, NvShader *vs, NvShader *fs, id<MTLFunction> fsfn, int merged) {
+     MTLRenderPipelineDescriptor *d = [MTLRenderPipelineDescriptor new];
+-    d.vertexFunction = vs->fn; d.fragmentFunction = fsfn ? fsfn : fs ? fs->fn : nil;
++    d.vertexFunction = vs ? vs->fn : nil; d.fragmentFunction = fsfn ? fsfn : fs ? fs->fn : nil;
+     // Diagnostic DM_NVN_HILITE=fragment shader key,...: these draws use a solid-color fragment instead (keys 1–6 in order magenta / green / cyan / yellow / blue / white), to see where the geometry lands
+     // Pipelines are built on several threads at once: the keys and the library are set up once (a lazy setup raced, and a thread used a library another had just replaced: Hades II, 6 keys)
+     if (fs) { static char keys[6][24]; static int nk; static id<MTLLibrary> hl; static dispatch_once_t once;
+@@ -6492,7 +6537,7 @@ static void lo_bind(id<MTLCommandEncoder> en) {
+         if (lf) d.fragmentFunction = lf;
+         else if (fsfn) RED_ONCE(136, "logic operation not applied to a specialized fragment (readable-tile merge or diagnostic) of %s", fs->key);
+     }
+-    if (vs->layer_out && k->fsfn != GEO_MARK) d.inputPrimitiveTopology = vs->geo_output == 1 ? MTLPrimitiveTopologyClassPoint : vs->geo_output == 6 ? MTLPrimitiveTopologyClassLine : MTLPrimitiveTopologyClassTriangle;
++    if (vs && vs->layer_out && k->fsfn != GEO_MARK) d.inputPrimitiveTopology = vs->geo_output == 1 ? MTLPrimitiveTopologyClassPoint : vs->geo_output == 6 ? MTLPrimitiveTopologyClassLine : MTLPrimitiveTopologyClassTriangle;
+     if (k->fsfn == AMP_MARK) d.maxVertexAmplificationCount = 2;   // a slice-merged pass's pipeline: the view mapping's layer offset applies (see g_sm_plan)
+     if (k->fsfn == TF_MARK || k->fsfn == GEO_MARK) { d.vertexFunction = k->fsfn == GEO_MARK ? vs->geo_fn : vs->tf_fn; d.fragmentFunction = nil; d.rasterizationEnabled = NO; }   // transform feedback capture (tf_draw)
+     if (k->fsfn == DISCARD_MARK) { d.vertexFunction = vs->discard_fn; d.fragmentFunction = nil; d.rasterizationEnabled = NO; }
+@@ -6524,6 +6569,7 @@ static void lo_bind(id<MTLCommandEncoder> en) {
+         }
+     }
+     d.depthAttachmentPixelFormat = (MTLPixelFormat)k->dfmt; d.stencilAttachmentPixelFormat = (MTLPixelFormat)k->sfmt;
++    if (!vs) return d;   // Mesh pipelines share color and depth state but have no vertex stage.
+     MTLVertexDescriptor *vd = [MTLVertexDescriptor vertexDescriptor];
+     const nvn_refl *rf = &vs->rf; int nconv = 0, on = vin_on(vs, k, k->fsfn == TF_MARK || k->fsfn == GEO_MARK || k->fsfn == DISCARD_MARK);
+     if (on) { d.vertexFunction = vs->vfn; g_vin_psos++; }   // the shadow-input entry point (see vin_on)
+@@ -8938,7 +8984,7 @@ static int sm_rt_slice(const p_set_rt *a, const p_set_rt *b, int *slice) {
+ }
+ // From the op after the draw that opens a pass: the layers the following targets switch to while nothing but state, uniform updates (deferred in the pass: ubd_on) and draws comes between.
+ // Returns the number of switches; lo..hi and the mask of layers drawn into
+-static int sm_scan(const uint8_t *p, const p_set_rt *rt, int cur, int *lo, int *hi, uint64_t *mask) {
++static int sm_scan(const uint8_t *p, const p_set_rt *rt, int cur, int mesh, int *lo, int *hi, uint64_t *mask) {
+     int n = 0; *lo = *hi = cur; *mask = cur < 64 ? 1ull << cur : 0;
+     for (int guard = 0; guard < 4096 && p; guard++) {
+         op_hdr h; memcpy(&h, p, sizeof h); const void *a = p + 8;
+@@ -8948,6 +8994,7 @@ static int sm_scan(const uint8_t *p, const p_set_rt *rt, int cur, int *lo, int *
+                 if (sl != cur) { n++; cur = sl; if (sl < *lo) *lo = sl; if (sl > *hi) *hi = sl; *mask |= 1ull << sl; } break; }
+             case OP_BARRIER: { int32_t bits; memcpy(&bits, a, 4); if (bits) return n; break; }
+             case OP_UPDATE_UB: if (!ubd_on()) return n; break;
++            case OP_BIND_VBUF1: case OP_BIND_UBO_SMALL: if (!mesh) return n; break;
+             case OP_DRAW: case OP_DRAW_IDX: case OP_VIEWPORTS: case OP_SCISSOR: case OP_DEPTH_RANGE: case OP_BIND_PROGRAM: case OP_BIND_STATE: case OP_BIND_VATTR: case OP_BIND_VSTREAM:
+             case OP_BIND_VBUF: case OP_BIND_UBO: case OP_BIND_SSBO: case OP_BIND_TEX: case OP_BIND_TEX1: case OP_BIND_SAMP: case OP_BIND_IMG: case OP_STENCIL: case OP_POLY_OFFSET:
+             case OP_BLEND_COLOR: case OP_ALPHA_REF: case OP_PUSH_CONST: case OP_DEPTH_CLAMP: case OP_VP_SWIZZLE: case OP_PRIM_RESTART: case OP_SET_TEX_POOL: case OP_SET_SAMP_POOL: case OP_COPY_STRIDE: break;
+@@ -8957,23 +9004,6 @@ static int sm_scan(const uint8_t *p, const p_set_rt *rt, int cur, int *lo, int *
+     }
+     return n;
+ }
+-// The draw about to open a pass: plan it as slice-merged when its target is one layer of an array or cube texture level and the next targets switch to other layers of that level
+-// (every layer between the lowest and the highest drawn into), and the draw's amplified pipeline is built (else it is queued, and this pass stays as it is)
+-static int draw_samples_rt(NvProg *pr);
+-static void sm_plan(NvProg *pr) {
+-    g_sm_plan.on = 0;
+-    if (!pr || !pr->sh[0] || pr->sh[0]->layer_out || R.clear_d || R.clear_s || draw_samples_rt(pr)) return;
+-    for (int i = 0; i < 8; i++) if (R.clear_c[i]) return;
+-    int cur; if (!sm_rt_slice(&R.rt, &R.rt, &cur) || cur >= 64) return;
+-    id<MTLTexture> t = tex_mtl(R.rt.color[0]);
+-    if (!t || t.sampleCount != 1 || mtl_fmt_block(t.pixelFormat) || mtl_fmt_depth(t.pixelFormat) || (t.textureType != MTLTextureType2DArray && t.textureType != MTLTextureTypeCube && t.textureType != MTLTextureTypeCubeArray)) return;
+-    int lo, hi; uint64_t mask; if (!sm_scan(g_exec_next, &R.rt, cur, &lo, &hi, &mask)) return;
+-    if (__builtin_popcountll(mask) != hi - lo + 1 || (NSUInteger)hi >= t.arrayLength * (t.textureType == MTLTextureType2DArray ? 1 : 6)) return;
+-    __typeof__(g_pass) keep = g_pass; memset(g_pass.cfmt, 0, sizeof g_pass.cfmt); g_pass.cfmt[0] = (uint32_t)t.pixelFormat; g_pass.dfmt = g_pass.sfmt = 0; g_pass.samples = 1;   // the key pso_get makes in the pass
+-    g_pso_amp = 1; id ps = pso_get(pr, nil); g_pso_amp = 0; g_pass = keep;
+-    if (!ps) { g_sm_nwait++; return; }
+-    g_sm_plan.on = 1; g_sm_plan.lo = lo; g_sm_plan.hi = hi;
+-}
+ // Experimental RT range candidate: only ignore positive nlevels differences not used by the actual render attachments; other fields stay word-for-word identical.
+ #define NVN_RT_RANGE_IMPL 1
+ static int rt_range_shape(const p_set_rt *a, const p_set_rt *b) {
+@@ -10642,6 +10672,31 @@ static int lc_same(const p_set_rt *a, int ka, const p_set_rt *b, int kb) {   //
+     int h1 = ka == 8 ? a->has_dview : a->has_cview[ka], h2 = kb == 8 ? b->has_dview : b->has_cview[kb];
+     return h1 == h2 && (!h1 || !memcmp(ka == 8 ? &a->dview : &a->cview[ka], kb == 8 ? &b->dview : &b->cview[kb], sizeof(view_t)));
+ }
++// Consecutive clears of distinct slices can land together. No draws or texture
++// reads occur between queued clears, and only one attachment is used in the pass.
++static unsigned lc_clear_run(const lc_group *first, const lc_group *end) {
++    static int enabled = -1;
++    if (enabled < 0) {
++        const char *value = getenv("DM_NVN_BATCH_LAYER_CLEARS");
++        enabled = value && !strcmp(value, "1");
++    }
++    const tex_t *tex = first->rt.color[0];
++    const view_t *view = &first->rt.cview[0];
++    if (!enabled || !tex || tex->d.target != NVN_TEXTURE_TARGET_2D_ARRAY ||
++        tex->d.samples > 1 || nvn_fmt_bc(tex->d.format) || first->rt.n != 1 ||
++        !first->clear_c[0] || first->clear_d || first->clear_s ||
++        !first->rt.has_cview[0] || !view->set_layers || view->nlayers != 1) return 1;
++    unsigned count = 1;
++    for (const lc_group *next = first + 1; next < end; next++) {
++        int slice;
++        if (next->rt.n != 1 || !next->clear_c[0] || next->clear_d || next->clear_s ||
++            memcmp(&first->cc[0], &next->cc[0], sizeof first->cc[0]) ||
++            !sm_rt_slice(&first->rt, &next->rt, &slice) ||
++            slice != view->min_layer + (int)count || (unsigned)slice >= tex->d.depth) break;
++        count++;
++    }
++    return count;
++}
+ // Land every waiting clear, oldest first, each group in a pass of its own (rp_flush's way)
+ static void lc_land(void) {
+     if (!g_nlc) return;
+@@ -10652,7 +10707,17 @@ static void lc_land(void) {
+         if (!any || !g_cb) continue;
+         R.rt = g->rt; R.has_rt = 1; memcpy(R.clear_c, g->clear_c, sizeof R.clear_c); memcpy(R.cc, g->cc, sizeof R.cc);
+         R.clear_d = g->clear_d; R.clear_s = g->clear_s; R.cd = g->cd; R.cs = g->cs;
+-        rp_begin_ex(1); rp_end(); g_lc_landed++; }
++        unsigned layers = lc_clear_run(g, g_lc + n);
++        g_lc_clear_layers = layers;
++        int opened = rp_begin_ex(1) != nil;
++        g_lc_clear_layers = 0;
++        rp_end(); g_lc_landed++;
++        if (opened && layers > 1) {
++            static int once;
++            if (!once++) MLOG("batch layer clears: %u consecutive slices in one render pass", layers);
++            gi += (int)layers - 1;
++        }
++    }
+     R = save;
+ }
+ // SetRenderTargets with clears pending and no draw since: the clears wait instead of opening a pass
+@@ -10884,7 +10949,129 @@ static void draw_multi(const p_multi_draw *m) {
+     g_mdxc.next = NULL;
+ }
+ static void draw_(const p_draw *dw, const p_draw_idx *di);
++static int sm_native_mesh_on(void) {
++    static int enabled = -1;
++    if (enabled < 0) {
++        const char *value = getenv("DM_NVN_WATER_MESH_MERGE");
++        enabled = value && !strcmp(value, "1") && !strcmp(DM_GAME_ID, "0400C3F00006E000") &&
++                  [g_dev supportsVertexAmplificationCount:2];
++    }
++    return enabled;
++}
++// The WaterSurface draws in the 128x128 layer burst use read-only task, mesh and pixel shaders.
++// The ordinary draw path sees only the pixel stage, so prove independence using the source program.
++static int sm_mesh_draw_ok(void) {
++    NvProg *pr = g_mtk.program;
++    if (!pr || !pr->sh[1] || !g_mtk.ms || g_vis_counting || S.rast_discard) return 0;
++    const char *fs = pr->sh[1]->key, *ms = g_mtk.ms->key;
++    if (g_mtk.ts) {
++        static const char * const cascade[][2] = {
++            {"fea1d6ca04512de1_b", "ddc034e8e009ebfc_b"},
++            {"933ec1a3cf0ab7d2_b", "bc699e9a7477948d_b"},
++            {"bb4f5d6f69383c2a_b", "58d9378494e1def4_b"},
++            {"c25a73e94b7e46d6_b", "59babf0c08e96395_b"},
++            {"f0c477b53373959e_b", "9f892ebe65b27825_b"},
++        };
++        if (strcmp(fs, "3cc3501255bb2d74_b")) return 0;
++        int known = 0;
++        for (size_t i = 0; i < sizeof cascade / sizeof cascade[0]; i++) {
++            known |= !strcmp(g_mtk.ts->key, cascade[i][0]) && !strcmp(ms, cascade[i][1]);
++        }
++        if (!known) return 0;
++    } else if (strcmp(ms, "0f972afb8a9dbd9a_b") || (strcmp(fs, "0d3f740b523e35b0_b") && strcmp(fs, "3cafb02cdf0d87fb_b"))) return 0;
++    if (prog_swrites(pr) || draw_samples_rt(pr)) return 0;
++    for (int st = 0; st < 5; st++) {
++        NvShader *sh = pr->sh[st];
++        if (!sh) continue;
++        for (int i = 0; i < sh->rf.nb; i++) {
++            const nvn_rbind *b = &sh->rf.b[i];
++            switch (b->kind) {
++                case NVN_RB_CBUF: case NVN_RB_UBOP: case NVN_RB_SBUFP: {
++                    if (b->reg >= 16) return 0;
++                    const p_bind_buf *binding = b->kind == NVN_RB_SBUFP ? &S.ssbo[st][b->reg] : &S.ubo[st][b->reg];
++                    if (csh_attachment_hit(binding->addr, binding->size)) return 0;
++                    break;
++                }
++                case NVN_RB_TBUF: case NVN_RB_TBUFU: case NVN_RB_IMG: case NVN_RB_IMGU:
++                case NVN_RB_SBUFU: case NVN_RB_GMEM: return 0;
++                default: break;
++            }
++        }
++    }
++    return 1;
++}
++// The draw about to open a pass: plan it as slice-merged when its target is one layer of an array or cube texture level and the next targets switch to other layers of that level
++// (every layer between the lowest and the highest drawn into), and the draw's amplified pipeline is built (else it is queued, and this pass stays as it is)
++static void sm_plan(NvProg *pr) {
++    g_sm_plan.on = 0;
++    if (!pr || R.clear_d || R.clear_s) return;
++    int mesh = g_mtk.on;
++    if (mesh ? !sm_mesh_draw_ok() : !pr->sh[0] || pr->sh[0]->layer_out || draw_samples_rt(pr)) return;
++    for (int i = 0; i < 8; i++) if (R.clear_c[i]) return;
++    int cur; if (!sm_rt_slice(&R.rt, &R.rt, &cur) || cur >= 64) return;
++    id<MTLTexture> t = tex_mtl(R.rt.color[0]);
++    if (!t || t.sampleCount != 1 || mtl_fmt_block(t.pixelFormat) || mtl_fmt_depth(t.pixelFormat) || (t.textureType != MTLTextureType2DArray && t.textureType != MTLTextureTypeCube && t.textureType != MTLTextureTypeCubeArray)) return;
++    int lo, hi; uint64_t mask; if (!sm_scan(g_exec_next, &R.rt, cur, mesh, &lo, &hi, &mask)) return;
++    if (__builtin_popcountll(mask) != hi - lo + 1 || (NSUInteger)hi >= t.arrayLength * (t.textureType == MTLTextureType2DArray ? 1 : 6)) return;
++    if (mesh && (cur != 0 || lo != 0 || hi != 4 || R.rt.cview[0].nlayers != 1 ||
++                 (R.rt.cview[0].set_levels && R.rt.cview[0].base_level != 0) ||
++                 t.textureType != MTLTextureType2DArray || t.width != 128 || t.height != 128 || t.pixelFormat != MTLPixelFormatRGBA16Float)) return;
++    __typeof__(g_pass) keep = g_pass; memset(g_pass.cfmt, 0, sizeof g_pass.cfmt); g_pass.cfmt[0] = (uint32_t)t.pixelFormat; g_pass.dfmt = g_pass.sfmt = 0; g_pass.samples = 1;   // the key the pipeline lookup makes in the pass
++    id ps;
++    if (mesh) ps = mtk_pso(pr, 0) ? mtk_pso(pr, 1) : nil;
++    else { g_pso_amp = 1; ps = pso_get(pr, nil); g_pso_amp = 0; }
++    g_pass = keep;
++    if (!ps) { g_sm_nwait++; return; }
++    g_sm_plan.on = mesh ? SM_NATIVE_MESH : SM_RASTER; g_sm_plan.lo = lo; g_sm_plan.hi = hi;
++}
+ static void draw(const p_draw *dw, const p_draw_idx *di) { cp_stamp start = cp_begin(); if (dw && dw->prim == DM_PRIM_MESH_TASKS) mesh_tasks_draw(dw); else draw_(dw, di); cp_end(5, start); }
++
++// Mario Kart World has two cube-map prefilters and matching single-sample variants.
++// Use the cheaper shaders for the game's six-face mip passes. Keep the original
++// programs for any other target layout, including passes with eight outputs.
++static NvProg *mkw_fast_reflections(NvProg *pr, const p_draw_idx *di) {
++    static int enabled = -1;
++    if (enabled < 0) {
++        const char *value = getenv("DM_MKW_FAST_REFLECTIONS");
++        enabled = value && !strcmp(value, "1") && !strcmp(DM_GAME_ID, "0400C3F00006E000");
++    }
++    if (!enabled || !di || di->count != 3 || di->instances != 1 || di->ind ||
++        S.rast_discard || S.tf_on || !R.has_rt || R.rt.n != 6 || R.rt.depth ||
++        !pr || !pr->sh[0] || !pr->sh[1] || pr->sh[2] || pr->sh[3] || pr->sh[4] || pr->sh[5] ||
++        strcmp(pr->sh[0]->key, "b98b715804d846dc_b")) return pr;
++
++    const char *fragment = pr->sh[1]->key;
++    int variant;
++    if (!strcmp(fragment, "4744589bb8f9f7dd_b")) variant = 0;
++    else if (!strcmp(fragment, "765844f5609bb11b_b")) variant = 1;
++    else return pr;
++
++    const tex_t *color = R.rt.color[0];
++    if (!color || color->d.width != 64 || color->d.height != 64) return pr;
++    uint64_t serial;
++    int level, slice;
++    rt_sub(&R.rt, 0, &serial, &level, &slice);
++    if (!serial || level < 1 || slice % 6) return pr;
++    for (int face = 1; face < 6; face++) {
++        uint64_t face_serial;
++        int face_level, face_slice;
++        rt_sub(&R.rt, face, &face_serial, &face_level, &face_slice);
++        if (face_serial != serial || face_level != level || face_slice != slice + face) return pr;
++    }
++
++    static NvProg *programs[2];
++    if (!programs[variant]) {
++        NvShader *shader = shader_get(variant == 0 ? @"44e97b7d3938bc98_b" : @"a10c3584fef50494_b", 1);
++        if (!shader) return pr;
++        NvProg *replacement = [NvProg new];
++        replacement->sh[0] = pr->sh[0];
++        replacement->sh[1] = shader;
++        programs[variant] = replacement;
++        MLOG("MKW fast reflections: %s -> %s for six-face mip passes", fragment, shader->key);
++    }
++    return programs[variant];
++}
++
+ static void draw_(const p_draw *dw, const p_draw_idx *di) {
+     g_draw_binst = (uint32_t)(dw ? dw->base_instance : di ? di->base_instance : 0);   // c0 + 0x644 of the stages that read the driver segment (encode_args)
+     if (passdump()) { NvProg *p = g_geo_program ? g_geo_program : S.prog ? prog_get(S.prog) : nil;
+@@ -10923,6 +11110,7 @@ static void draw_(const p_draw *dw, const p_draw_idx *di) {
+     g_mdxc.next = NULL;
+     if (!S.prog) { RED_ONCE(18, "no program bound before the draw"); PD("Z %llu draw skipped: no program bound", g_stat_pass + !g_enc); return; }
+     __unsafe_unretained NvProg *pr = g_geo_program ? g_geo_program : prog_get(S.prog);
++    if (!g_geo_program) pr = mkw_fast_reflections(pr, di);
+     image_prepare(pr, 0x1f);
+     draw_gs_check(pr);   // a geometry stage left with no function (see prog_fold_gs)
+     if (!g_geo_program && S.rast_discard && S.tf_on) { tf_draw(pr, dw, di); return; }
+@@ -10997,8 +11185,12 @@ static void draw_(const p_draw *dw, const p_draw_idx *di) {
+     if (!g_enc) { g_fd_dw = dw; g_fd_di = di; }
+     g_rp_layered = pr->sh[0] && pr->sh[0]->layer_out;
+     if (g_enc && g_pass.layered != g_rp_layered) rp_end();   // a layered pass only for layer-writing vertex shaders (see rp_begin_ex)
+-    if (g_enc && g_sm_pass && draw_samples_rt(pr)) { PD("M %llu a draw in the slice-merged pass samples its attachment; split here", g_stat_pass); rp_end(); }
+-    if (!g_enc && mode == 0 && !g_rp_layered && !defer_q_draw && g_exec_next && !tbdr_on() && !g_geo_program && sm_on()) sm_plan(pr);
++    if (g_enc && g_sm_pass) {
++        int split = g_sm_pass == SM_NATIVE_MESH ? !g_mtk.on || g_game_barrier || !sm_mesh_draw_ok() : (g_mtk.on && sm_native_mesh_on()) || draw_samples_rt(pr);
++        if (split) { PD("M %llu a draw is incompatible with the slice-merged pass; split here", g_stat_pass); rp_end(); }
++    }
++    if (!g_enc && mode == 0 && !g_rp_layered && !defer_q_draw && g_exec_next && !tbdr_on() && sm_on() &&
++        (!g_geo_program || (g_mtk.on && sm_native_mesh_on()))) sm_plan(pr);
+     vbuf_prepare(pr->sh[0] ? &pr->sh[0]->rf : NULL, dw, di);   // an unaligned GPU-written stream, or one the draw reads past, needs its ordered copy before the render encoder
+     id<MTLRenderCommandEncoder> en = rp_begin_ex(mode);
+     g_rp_layered = 0; g_sm_plan.on = 0;
+@@ -11017,7 +11209,17 @@ static void draw_(const p_draw *dw, const p_draw_idx *di) {
+     static id<MTLRenderPipelineState> cur_ps; static NvProg *cur_pr; static uint64_t cur_ps_pass; static int cur_pull;   // cur_pull: a hybrid (pulling) pipeline, asked for again at the next draw
+     if (g_fz.active && !g_defer_replaying) { g_pso_lmap = g_fz.phase == 1 ? g_fz.lmap1 : g_fz.lmap2; g_pso_fsfn = g_fz.phase == 1 ? nil : fz_fn; g_pso_fz = g_fz.phase == 1 ? (pso_fz_desc){0} : g_fz_desc; g_pso_dirty = 1; }   // Readable tile merge: fetch the pipeline by the physical -> logical mapping and the specialization
+     else if (g_fb_tseq == g_draw_seq && g_fb_tfn && !g_defer_replaying) { g_pso_lmap = g_fb_tlmap; g_pso_fsfn = g_fb_tfn; g_pso_fz = g_fb_tdesc; g_pso_dirty = 1; }   // same-pass feedback read from the tile (fb_tile_plan)
+-    if (g_mtk.on) { cur_ps = mtk_pso(pr); cur_pull = 0; cur_pr = nil; if (!cur_ps) { g_mtk.miss = 1; return; } }   // a task / mesh draw (mesh_tasks_draw)
++    if (g_mtk.on) {
++        cur_ps = mtk_pso(pr, g_sm_pass == SM_NATIVE_MESH);
++        if (!cur_ps && g_sm_pass == SM_NATIVE_MESH) {
++            g_sm_nwait++;
++            PD("M %llu WaterSurface mesh slice-merged pass: no amplified pipeline yet; split here", g_stat_pass);
++            rp_end(); en = rp_begin_ex(mode); if (!en) return;
++            cur_ps = mtk_pso(pr, 0);
++        }
++        cur_pull = 0; cur_pr = nil;
++        if (!cur_ps) { g_mtk.miss = 1; return; }
++    }
+     else if (g_geo_mesh.on) { cur_ps = geo_mesh_pso(pr); cur_pull = 1; cur_pr = nil; if (!cur_ps) { g_geo_mesh.miss = 1; return; } }   // a mesh draw (geo_mesh_draw): pulls its streams; the next draw fetches its own pipeline; none yet: the compute path draws
+     else if (g_pso_dirty || pr != cur_pr || cur_ps_pass != g_pass.serial) { g_pso_amp = g_sm_pass; cur_ps = pso_get(pr, nil); g_pso_amp = 0; cur_pull = g_pso_pull; cur_pr = pr; cur_ps_pass = g_pass.serial; g_pso_dirty = !cur_ps || cur_pull; }
+     if (!cur_ps && g_sm_pass) {   // a draw whose amplified pipeline is not built yet (sm_amp_get queued it): the slice-merged pass ends and the draw opens a pass of its own
+@@ -13513,8 +13715,9 @@ uint64_t mtl_snap_acquire_wait(void) {
+     if (ws_on()) ws_put(WS_SNAP, w0, blocked);
+     return ws_t0() - w0;
+ }
+-// Copy the presented texture into the next ring slot; returns the slot's serial (0 = no snapshot: the game's texture is presented as before)
+-static uint64_t snap_take(const tex_t *t) {
++// Copy the presented texture into the next ring slot; returns the slot's serial (0 = no snapshot: the game's texture is presented as before).
++// When the crop is baked into the copy, the display must sample the whole slot.
++static uint64_t snap_take(const tex_t *t, const int crop[4], int *cropped) {
+     int k = (int)(atomic_load(&g_snap_next) % (uint64_t)g_snap_n);
+     pthread_mutex_lock(&g_pq_mu); int busy = atomic_load(&g_snap[k].ticket) > g_pq_done; pthread_mutex_unlock(&g_pq_mu);
+     uint64_t ev = atomic_load(&g_snap[k].ev);
+@@ -13523,6 +13726,13 @@ static uint64_t snap_take(const tex_t *t) {
+     // signals g_snap_ev only after all work committed before the signal, so those presents have run and it can leave the residency set
+     if (g_snap[k].old) { [g_snap_res removeAllocation:g_snap[k].old]; [g_snap_res commit]; g_snap[k].old = nil; }
+     id<MTLTexture> src = tex_mtl(t); if (!src) return 0;
++    static int crop_enabled = -1;
++    if (crop_enabled < 0) {
++        const char *value = getenv("DM_PRESENT_SNAP_CROP");
++        crop_enabled = value && !strcmp(value, "1");
++    }
++    NSUInteger rect[4] = {0, 0, src.width, src.height};
++    if (crop_enabled && !present_crop_rect(src, crop, rect)) return 0;
+     // The copy reads the source before present_now runs, so it needs the same commit as present_now: a window texture presented before any submission has used it was made just
+     // now and is outside the committed residency set. DRAGON QUEST XI S presents three times before its first submission; on an A17 Pro the copy faulted silently (its command buffer
+     // has no error handler) and every later command buffer of the process was ignored (GitHub issue #626). A commit with nothing new costs nothing
+@@ -13538,8 +13748,8 @@ static uint64_t snap_take(const tex_t *t) {
+         }
+     }
+     id<MTLTexture> dst = g_snap[k].tex;
+-    if (!dst || dst.width != src.width || dst.height != src.height || dst.pixelFormat != src.pixelFormat) {
+-        MTLTextureDescriptor *d = [MTLTextureDescriptor texture2DDescriptorWithPixelFormat:src.pixelFormat width:src.width height:src.height mipmapped:NO];
++    if (!dst || dst.width != rect[2] || dst.height != rect[3] || dst.pixelFormat != src.pixelFormat) {
++        MTLTextureDescriptor *d = [MTLTextureDescriptor texture2DDescriptorWithPixelFormat:src.pixelFormat width:rect[2] height:rect[3] mipmapped:NO];
+         d.storageMode = MTLStorageModePrivate; d.usage = MTLTextureUsageShaderRead;
+         // The old texture stays resident (and referenced) until the slot's next use: the busy check above means its last present was committed, not that the GPU has run it,
+         // and a texture removed here was sampled outside the residency set by a display command buffer still queued
+@@ -13555,7 +13765,7 @@ static uint64_t snap_take(const tex_t *t) {
+     [cb beginCommandBufferWithAllocator:g_snap_alloc[k]];
+     id<MTL4ComputeCommandEncoder> ce = [cb computeCommandEncoder];
+     [ce barrierAfterQueueStages:MTLStageAll beforeStages:MTLStageBlit visibilityOptions:resource_vis()];   // after the frame's work and the slot's last blit to the screen
+-    [ce copyFromTexture:src sourceSlice:0 sourceLevel:0 sourceOrigin:MTLOriginMake(0, 0, 0) sourceSize:MTLSizeMake(src.width, src.height, 1) toTexture:dst destinationSlice:0 destinationLevel:0 destinationOrigin:MTLOriginMake(0, 0, 0)];
++    [ce copyFromTexture:src sourceSlice:0 sourceLevel:0 sourceOrigin:MTLOriginMake(rect[0], rect[1], 0) sourceSize:MTLSizeMake(rect[2], rect[3], 1) toTexture:dst destinationSlice:0 destinationLevel:0 destinationOrigin:MTLOriginMake(0, 0, 0)];
+     [ce barrierAfterStages:MTLStageBlit beforeQueueStages:MTLStageAll visibilityOptions:resource_vis()];   // the game's next writes to its texture come after the copy
+     [ce endEncoding]; [cb endCommandBuffer];
+     uint64_t v = ++g_snap_v;
+@@ -13571,6 +13781,7 @@ static uint64_t snap_take(const tex_t *t) {
+         atomic_store(&g_snap_cmt, v);
+     }
+     g_snap[k].ev = v;
++    *cropped = rect[0] || rect[1] || rect[2] != src.width || rect[3] != src.height;
+     return g_snap[k].serial;
+ }
+ static uint64_t present_enqueue(const tex_t *t, double period, const int crop[4], uint64_t ev_val) {
+@@ -13590,15 +13801,15 @@ static uint64_t present_enqueue(const tex_t *t, double period, const int crop[4]
+         else if (st == 2 && now - t0 >= at + dur) { st = 3; mtl_link_pause(0); MLOG("DM_TEST_LINK_STALL: resuming the display link (frame %llu)", (unsigned long long)atomic_load(&g_cur_frame)); }
+     }
+     if (ws_on()) { static uint64_t f0; uint64_t f = atomic_load(&g_cur_frame); if (!f0) f0 = f; else if (f >= f0 + 300) { ws_report(f, f - f0); f0 = f; } }
+-    tex_t snap; uint64_t ss = 0; int slot = 0;
++    tex_t snap; uint64_t ss = 0; int slot = 0, cropped = 0;
+     if (t && !ev_val && mtl_snap_on()) {
+         slot = (int)(atomic_load(&g_snap_next) % (uint64_t)g_snap_n);
+-        if ((ss = snap_take(t))) { memset(&snap, 0, sizeof snap); snap.magic = MAGIC('T', 'E', 'X', 0); snap.serial = ss; t = &snap; }
++        if ((ss = snap_take(t, crop, &cropped))) { memset(&snap, 0, sizeof snap); snap.magic = MAGIC('T', 'E', 'X', 0); snap.serial = ss; t = &snap; }
+     }
+     pthread_mutex_lock(&g_pq_mu);
+     while (g_pq_in - g_pq_done >= PQ) pthread_cond_wait(&g_pq_cv, &g_pq_mu);   // Wait only when the queue is full; normally AcquireTexture blocks first
+     pq_item *it = &g_pq[g_pq_in % PQ]; *it = (pq_item){*t, period, atomic_load(&g_cur_frame), {0}, CACurrentMediaTime(), ev_val, ss ? g_snap[slot].ev : 0};
+-    if (crop) memcpy(it->crop, crop, sizeof it->crop);   // The current frame's state is enqueued with the ticket number, rather than reading the mutable window late on the present thread
++    if (crop && !cropped) memcpy(it->crop, crop, sizeof it->crop);   // Preserve the original crop if the snapshot did not apply it.
+     uint64_t tk = ++g_pq_in;
+     if (ss) { g_snap[slot].ticket = tk; atomic_fetch_add(&g_snap_next, 1); }
+     pthread_cond_broadcast(&g_pq_cv);
+diff --git a/dm/gfx/tests/Makefile b/dm/gfx/tests/Makefile
+index 5288b37c..f15930a8 100644
+--- a/dm/gfx/tests/Makefile
++++ b/dm/gfx/tests/Makefile
+@@ -185,6 +185,8 @@ check_t_present_snap: t_present_snap
+ 	DM_NVN_ENC_THREAD=0 MTL_DEBUG_LAYER=1 ./t_present_snap pacing
+ 	DM_NVN_ENC_THREAD=1 MTL_DEBUG_LAYER=1 ./t_present_snap resize
+ 	DM_NVN_ENC_THREAD=0 MTL_DEBUG_LAYER=1 ./t_present_snap resize
++	DM_NVN_ENC_THREAD=1 MTL_DEBUG_LAYER=1 ./t_present_snap crop
++	DM_NVN_ENC_THREAD=0 MTL_DEBUG_LAYER=1 ./t_present_snap crop
+ t_reorder_chain: t_reorder_chain.m $(MTL_T_DEP)
+ 	clang $(CFLAGS) -fobjc-arc -o $@ t_reorder_chain.m $(MTL_T_SRC) $(FW)
+ check_t_reorder_chain: RUN_ENV = MTL_DEBUG_LAYER=1
+diff --git a/dm/gfx/tests/t_clear_layers.m b/dm/gfx/tests/t_clear_layers.m
+index d341957f..9a4282c6 100644
+--- a/dm/gfx/tests/t_clear_layers.m
++++ b/dm/gfx/tests/t_clear_layers.m
+@@ -11,16 +11,18 @@ void svc_thread_dump(void) {}
+ enum { W = 4, OLD_D = 0x3f400000, NEW_D = 0x3e800000, OLD_C = 0x11223344, NEW_C = 0x80808080 };   // depth .75 → .25; RGBA8 → 0.5 in every channel
+ 
+ int main(void) { @autoreleasepool {
++    setenv("DM_NVN_BATCH_LAYER_CLEARS", "1", 1);
+     mtl_init();
+     id<MTLCommandQueue> queue = [g_dev newCommandQueue];
+     // depth: a cube (6 faces) or a 2D array of colour; view: none, or min_layer / nlayers (0: the rest)
+-    struct { int depth, target, layers, view, min_layer, nlayers; const char *label; } cases[] = {
++    struct { int depth, target, layers, view, min_layer, nlayers; const char *label; int queue_slices; } cases[] = {
+         {1, NVN_TEXTURE_TARGET_CUBEMAP, 6, 0, 0, 0, "depth clear of a cube without a view clears all six faces"},
+         {1, NVN_TEXTURE_TARGET_CUBEMAP, 6, 1, 2, 1, "depth clear through a one-face view clears that face only"},
+         {0, NVN_TEXTURE_TARGET_2D_ARRAY, 4, 0, 0, 0, "colour clear of a 2D array without a view clears every layer"},
+         {0, NVN_TEXTURE_TARGET_2D_ARRAY, 4, 1, 1, 0, "colour clear through a view from layer 1 on clears layers 1-3"},
+         {0, NVN_TEXTURE_TARGET_2D_ARRAY, 4, 1, 1, 2, "colour clear through a two-layer view clears layers 1-2"},
+         {0, NVN_TEXTURE_TARGET_2D, 1, 0, 0, 0, "colour clear of a 2D target stays one layer"},
++        {0, NVN_TEXTURE_TARGET_2D_ARRAY, 5, 1, 1, 3, "queued clears batch layers 1-3 and preserve their neighbors", 1},
+     };
+     for (unsigned i = 0; i < sizeof cases / sizeof *cases; i++) {
+         tex_t t = {.magic = MAGIC('T','E','X',0), .serial = 99501 + i};
+@@ -51,7 +53,18 @@ int main(void) { @autoreleasepool {
+         if (cases[i].depth) { ops.head = (op_hdr){OP_CLEAR_DS, sizeof(op_hdr) + sizeof(p_clear_ds)}; ops.clear.ds = (p_clear_ds){.depth = .25, .depth_mask = 1}; }
+         else { ops.head = (op_hdr){OP_CLEAR_COLOR, sizeof(op_hdr) + sizeof(p_clear_color)}; ops.clear.c = (p_clear_color){.index = 0, .mask = 0xf, .rgba = {.5f, .5f, .5f, .5f}}; }
+         ((op_hdr *)((uint8_t *)&ops + ops.head.size))->op = OP_END; ((op_hdr *)((uint8_t *)&ops + ops.head.size))->size = sizeof(op_hdr);
+-        mtl_exec((const uint8_t *)&ops);
++        if (cases[i].queue_slices) {
++            uint64_t pass_before = g_stat_pass;
++            R.rt.cview[0].nlayers = 1;
++            for (int s = cases[i].min_layer; s < cases[i].min_layer + cases[i].nlayers; s++) {
++                R.rt.cview[0].min_layer = (uint16_t)s;
++                R.clear_c[0] = 1;
++                R.cc[0] = MTLClearColorMake(.5, .5, .5, .5);
++                lc_push();
++            }
++            lc_land();
++            CHECK(g_stat_pass - pass_before == 1, "three queued clears use one render pass");
++        } else mtl_exec((const uint8_t *)&ops);
+         mtl_sub_commit(); mtl_drain();
+         CHECK(!mtl_last_commit_error(), "production clear completes without GPU error");
+         id<MTLBuffer> result = [g_dev newBufferWithLength:W * W * 4 * cases[i].layers options:MTLResourceStorageModeShared];
+diff --git a/dm/gfx/tests/t_nvn.c b/dm/gfx/tests/t_nvn.c
+index a7b7ad8b..18c03e52 100644
+--- a/dm/gfx/tests/t_nvn.c
++++ b/dm/gfx/tests/t_nvn.c
+@@ -58,6 +58,7 @@ static size_t tex_size(int fmt, int w, int h, int flags, size_t *align) {
+ 
+ int main(void) {
+     setenv("DM_NVN_COUNT", "1", 1);   // the call-count checks below need the counting trampolines (off by default)
++    setenv("DM_RT_PERIOD_STABLE", "1", 1);
+     // Engine-native limiters have no FPS state page. Their launcher cap must
+     // still pace presents and select the display-link rate in display mode.
+     { win_t w={.interval=1};nvn_present_config(60,1);dm_fps_state=NULL;
+@@ -73,8 +74,12 @@ int main(void) {
+       EXPECT("no cap preserves display pacing",1,present_itv(&w));nvn_present_config(60,0);
+       EXPECT("no cap preserves game pacing",2,present_itv(&w));
+       // the 30 Hz link only for even intervals: interval 3 (20 fps) has no whole number of 30 Hz ticks and stays on the 60 Hz link
+-      w.interval=1;present_period(&w);w.interval=2;present_period(&w);g_itv2_since=(now_ns()-2000000000ull)|1;
++      w.interval=1;present_period(&w);w.interval=2;
++      EXPECT("short interval 2 still presents at 2 ticks",33333333,present_period(&w));
++      EXPECT("short interval 2 keeps the scheduler period",16666666,rt_period_ns(&w,33333333));
++      g_itv2_since=(now_ns()-2000000000ull)|1;
+       EXPECT("interval 2 held a second: 30 Hz link",30,nvn_game_fps());
++      EXPECT("sustained interval 2 sets a 30 Hz scheduler period",33333333,rt_period_ns(&w,33333333));
+       w.interval=3;present_period(&w);
+       EXPECT("interval 3: 60 Hz link",60,nvn_game_fps());
+       w.interval=4;present_period(&w);g_itv2_since=(now_ns()-2000000000ull)|1;
+diff --git a/dm/gfx/tests/t_perf_order.m b/dm/gfx/tests/t_perf_order.m
+index 3dcf2b44..d9d8a512 100644
+--- a/dm/gfx/tests/t_perf_order.m
++++ b/dm/gfx/tests/t_perf_order.m
+@@ -132,6 +132,91 @@ static void slices(id<MTLLibrary> lib) {
+     CHECK("dynamic reflection splits merged pass",draw_samples_rt(p));
+     g_exec_next=NULL; g_sm_plan.on=0;
+ }
++static void mesh_slices(id<MTLLibrary> lib) {
++    if (![g_dev supportsFamily:MTLGPUFamilyApple7]) return;
++    enum { MESH_W = 128, MESH_SLICES = 6, MESH_BPP = 8 };
++    const NSUInteger row = MESH_W * MESH_BPP, image = row * MESH_W;
++    tex_t t = texture(NVN_TEXTURE_TARGET_2D_ARRAY, NVN_FORMAT_RGBA16F, MESH_SLICES);
++    t.d.width = t.d.height = MESH_W;
++    nvn_tex_layout(&t.d, &t.L);
++    id<MTLTexture> mt = tex_mtl(&t);
++    prog_t pg = {0};
++    NvProg *p = make_program(lib, &pg, "red");
++    p->sh[0] = nil;
++    snprintf(p->sh[1]->key, sizeof p->sh[1]->key, "3cc3501255bb2d74_b");
++    NvShader *task = p->sh[3] = [NvShader new], *mesh = p->sh[4] = [NvShader new];
++    task->fn = [lib newFunctionWithName:@"test_task"];
++    task->stage = 3; task->mesh_kind = 1; task->mesh_threads = 1; task->mesh_payload = 4;
++    snprintf(task->key, sizeof task->key, "fea1d6ca04512de1_b");
++    mesh->fn = [lib newFunctionWithName:@"test_mesh"];
++    mesh->stage = 4; mesh->mesh_kind = 2; mesh->mesh_threads = 1;
++    snprintf(mesh->key, sizeof mesh->key, "ddc034e8e009ebfc_b");
++
++    // Wait for these two real pipeline variants so the test measures the replay
++    // and compares ordinary rendering to the opt-in pass, even on a cold cache.
++    reset();
++    __typeof__(g_pass) keep = g_pass;
++    memset(g_pass.cfmt, 0, sizeof g_pass.cfmt);
++    g_pass.cfmt[0] = MTLPixelFormatRGBA16Float; g_pass.dfmt = g_pass.sfmt = 0; g_pass.samples = 1;
++    g_mtk.ts = task; g_mtk.ms = mesh;
++    int ready = 0, merge = sm_on() && sm_native_mesh_on();
++    for (int attempt = 0; attempt < 2000 && !ready; attempt++) {
++        ready = mtk_pso(p, 0) && (!merge || mtk_pso(p, 1));
++        if (!ready) usleep(1000);
++    }
++    g_mtk.ts = g_mtk.ms = nil;
++    g_pass = keep;
++    CHECK("mesh pipeline variants become ready", ready);
++    if (!ready) return;
++
++    for (int barrier = 0; barrier < 2; barrier++) {
++        id<MTLCommandBuffer> cb = [g_q commandBuffer];
++        for (int sl = 0; sl < MESH_SLICES; sl++) {
++            MTLRenderPassDescriptor *init = [MTLRenderPassDescriptor renderPassDescriptor];
++            init.colorAttachments[0].texture = mt;
++            init.colorAttachments[0].slice = sl;
++            init.colorAttachments[0].loadAction = MTLLoadActionClear;
++            init.colorAttachments[0].storeAction = MTLStoreActionStore;
++            init.colorAttachments[0].clearColor = MTLClearColorMake(0, 0, 1, 1);
++            [[cb renderCommandEncoderWithDescriptor:init] endEncoding];
++        }
++        [cb commit]; [cb waitUntilCompleted];
++        CHECK("mesh slice sentinels initialize", cb.status == MTLCommandBufferStatusCompleted);
++
++        chain c = {0};
++        bind(&c, &pg, 0xff);
++        for (int sl = 0; sl < MESH_SLICES - 1; sl++) {
++            if (barrier && sl == 1) {
++                uint32_t bits = NVN_BARRIER_ORDER_FRAGMENTS_BIT;
++                emit(&c, OP_BARRIER, &bits, sizeof bits);
++            }
++            rt(&c, &t, sl, NULL);
++            p_draw d = {.prim = DM_PRIM_MESH_TASKS, .count = 1, .instances = 1};
++            emit(&c, OP_DRAW, &d, sizeof d);
++        }
++        uint64_t before = g_sm_ncont;
++        execute(&c);
++        CHECK(barrier ? "game barrier prevents mesh slice merge" : "five mesh draws take four slice continuations when enabled",
++              g_sm_ncont - before == (merge && !barrier ? 4 : 0));
++
++        id<MTLBuffer> out = [g_dev newBufferWithLength:image * MESH_SLICES options:MTLResourceStorageModeShared];
++        cb = [g_q commandBuffer];
++        id<MTLBlitCommandEncoder> enc = [cb blitCommandEncoder];
++        for (int sl = 0; sl < MESH_SLICES; sl++) {
++            [enc copyFromTexture:mt sourceSlice:sl sourceLevel:0 sourceOrigin:MTLOriginMake(0,0,0) sourceSize:MTLSizeMake(MESH_W,MESH_W,1)
++                        toBuffer:out destinationOffset:sl*image destinationBytesPerRow:row destinationBytesPerImage:image];
++        }
++        [enc endEncoding]; [cb commit]; [cb waitUntilCompleted];
++        CHECK("mesh slice readback completes", cb.status == MTLCommandBufferStatusCompleted);
++        const uint16_t red[] = {0x3c00, 0, 0, 0x3c00}, blue[] = {0, 0, 0x3c00, 0x3c00};
++        const uint8_t *pixels = out.contents;
++        int wrong = 0;
++        for (int sl = 0; sl < MESH_SLICES; sl++) for (int i = 0; i < MESH_W * MESH_W; i++) {
++            wrong += memcmp(pixels + sl * image + i * MESH_BPP, sl < MESH_SLICES - 1 ? red : blue, MESH_BPP) != 0;
++        }
++        CHECK("five layers are red and the unused sixth layer stays blue", !wrong);
++    }
++}
+ static void hoists(id<MTLLibrary> lib) {
+     prog_t pg={0}, cp={.serial=910000}; make_program(lib,&pg,"red");
+     NvProg *cs=[NvProg new]; cs->sh[5]=[NvShader new]; cs->sh[5]->stage=5;
+@@ -302,14 +387,25 @@ int main(int argc, char **argv) { @autoreleasepool {
+         alarm(10); setbuf(stdout,NULL); wait_budgets(); posts();
+         printf("CPU completion: %d checks, %d failed\n",checks,failed); return failed!=0;
+     }
+-    alarm(30); setbuf(stdout,NULL); mtl_init();
++    alarm(30); setbuf(stdout,NULL); setenv("DM_NVN_WATER_MESH_MERGE", "1", 0); mtl_init();
+     NSError *error=nil;
+     id<MTLLibrary> lib=[g_dev newLibraryWithSource:@"#include <metal_stdlib>\nusing namespace metal;\n"
+         "vertex float4 v(uint i [[vertex_id]]) { float2 p[3]={float2(-1,-1),float2(3,-1),float2(-1,3)}; return float4(p[i],0,1); }\n"
+         "fragment float4 red() { return float4(1,0,0,1); }\n"
++        "struct MeshVertex { float4 position [[position]]; };\n"
++        "struct MeshPrimitive { uint id [[primitive_id]]; };\n"
++        "struct Payload { uint draw; };\n"
++        "using Mesh = mesh<MeshVertex,MeshPrimitive,3,1,topology::triangle>;\n"
++        "[[object]] void test_task(object_data Payload &p [[payload]], mesh_grid_properties grid) { p.draw=42; grid.set_threadgroups_per_grid(uint3(1)); }\n"
++        "[[mesh]] void test_mesh(Mesh out, const object_data Payload &p [[payload]]) {\n"
++        "    if (p.draw!=42) { out.set_primitive_count(0); return; }\n"
++        "    out.set_vertex(0,MeshVertex{float4(-1,-1,0,1)}); out.set_vertex(1,MeshVertex{float4(3,-1,0,1)});\n"
++        "    out.set_vertex(2,MeshVertex{float4(-1,3,0,1)}); out.set_index(0,0); out.set_index(1,1); out.set_index(2,2);\n"
++        "    out.set_primitive(0,MeshPrimitive{0}); out.set_primitive_count(1);\n"
++        "}\n"
+         "struct Args { device uint *p [[id(0)]]; };\n"
+         "kernel void compute_one(constant Args &a [[buffer(0)]]) { *a.p=73; }\n" options:nil error:&error];
+     if(!lib) { fprintf(stderr,"%s\n",error.localizedDescription.UTF8String); return 2; }
+-    slices(lib); hoists(lib); posts();
++    slices(lib); mesh_slices(lib); hoists(lib); posts();
+     printf("performance ordering: %d checks, %d failed\n",checks,failed); return failed!=0;
+ } }
+diff --git a/dm/gfx/tests/t_present_snap.m b/dm/gfx/tests/t_present_snap.m
+index c1f37526..f8068f26 100644
+--- a/dm/gfx/tests/t_present_snap.m
++++ b/dm/gfx/tests/t_present_snap.m
+@@ -110,6 +110,25 @@ static void pending_copy_case(void) {
+     pixels(g_snap[0].tex, 73); pixels(g_snap[1].tex, 73);
+ }
+ static void snap_present(const tex_t *t) { present_enqueue(t, 1. / 60, NULL, 0); mtl_present_flush(); snap_commit_wait(g_snap_v); }
++static void crop_case(void) {
++    setenv("DM_PRESENT_SNAP_CROP", "1", 1);
++    tex_t source = source_n(0, 16);
++    id<MTLTexture> src = tex_mtl(&source);
++    uint8_t inside[256]; memset(inside, 41, sizeof inside);
++    [src replaceRegion:MTLRegionMake2D(3, 5, 8, 8) mipmapLevel:0 withBytes:inside bytesPerRow:32];
++    const int crop[4] = {3, 5, 8, 8};
++    CHECK("valid crop uses a snapshot", present_enqueue(&source, 1. / 60, crop, 0) == 0);
++    mtl_present_flush(); snap_commit_wait(g_snap_v);
++    CHECK("cropped copy completes", [g_snap_ev waitUntilSignaledValue:g_snap_v timeoutMS:2000]);
++    CHECK("snapshot holds only the cropped rectangle", g_snap[0].tex.width == 8 && g_snap[0].tex.height == 8);
++    const int whole[4] = {0};
++    CHECK("the queued cropped snapshot uses its whole texture", !memcmp(g_pq[0].crop, whole, sizeof whole));
++    pixels(g_snap[0].tex, 41);
++    const int invalid[4] = {12, 5, 8, 8};
++    CHECK("invalid crop leaves the original texture queued", present_enqueue(&source, 1. / 60, invalid, 0) != 0);
++    mtl_present_flush();
++    CHECK("fallback preserves the original crop", !memcmp(g_pq[1].crop, invalid, sizeof invalid));
++}
+ // A new presented size replaces the ring slot's texture while a present that sampled the old one may still be queued on the GPU (a gate holds the queue): the old texture stays
+ // resident until the slot's next use, which comes only after the replacing copy, and with it everything queued before, has run
+ static void resize_case(void) {
+@@ -146,6 +165,7 @@ int main(int argc, char **argv) { @autoreleasepool {
+     else if (!strcmp(argv[1], "pacing")) pacing_case();
+     else if (!strcmp(argv[1], "copy")) pending_copy_case();
+     else if (!strcmp(argv[1], "resize")) resize_case();
++    else if (!strcmp(argv[1], "crop")) crop_case();
+     else return 2;
+     printf("present snapshots: %d checks, %d failed\n", checks, failed); return failed != 0;
+ } }
+diff --git a/dm/gfx/tests/t_view_levels.m b/dm/gfx/tests/t_view_levels.m
+index 09a3188f..d31cfd38 100644
+--- a/dm/gfx/tests/t_view_levels.m
++++ b/dm/gfx/tests/t_view_levels.m
+@@ -27,6 +27,8 @@ static void view_case(int tid, unsigned level, unsigned count, unsigned expected
+         CHECK(view.width == (64u >> level), "view retains requested base level");
+         CHECK(view.arrayLength == layers, "array layers preserved");
+         CHECK(tex_by_id(tid) == view, "cached view preserves range");
++        CHECK((view == base) == (vc_identity_on() && level == 0 && expected == 7 && layers == 1),
++              "only an enabled, full-range identity 2D view reuses the base");
+     }
+     os_unfair_lock_unlock(&g_rmu);
+ }
+diff --git a/dm/host/front_mac.m b/dm/host/front_mac.m
+index fdf092e2..186f78f0 100644
+--- a/dm/host/front_mac.m
++++ b/dm/host/front_mac.m
+@@ -49,9 +49,20 @@ int front_display_pixels(int *w, int *h) {
+ int front_screen_variable_refresh(void) { return g_screen_variable_refresh; }
+ static void screen_refresh(NSScreen *screen) {   // main thread: refresh capabilities of the current screen and mode, including a mode change without moving the window
+     if (!screen) return;
+-    g_screen_fps = (int)screen.maximumFramesPerSecond;
+-    g_screen_id = [screen.deviceDescription[@"NSScreenNumber"] unsignedIntValue];
+-    g_screen_variable_refresh = screen.minimumRefreshInterval > 0 && screen.maximumRefreshInterval > screen.minimumRefreshInterval;
++    CGDirectDisplayID id = [screen.deviceDescription[@"NSScreenNumber"] unsignedIntValue];
++    int variable = screen.minimumRefreshInterval > 0 && screen.maximumRefreshInterval > screen.minimumRefreshInterval;
++    int fps = (int)screen.maximumFramesPerSecond;
++    if (id && !variable) {
++        CGDisplayModeRef mode = CGDisplayCopyDisplayMode(id);
++        if (mode) {
++            double hz = CGDisplayModeGetRefreshRate(mode);
++            if (hz > 0) fps = (int)round(hz);
++            CGDisplayModeRelease(mode);
++        }
++    }
++    g_screen_id = id;
++    g_screen_variable_refresh = variable;
++    g_screen_fps = fps;
+ }
+ static _Atomic int g_fullscreen;   // the window is in fullscreen (set when it has entered and when it has left)
+ // The software keyboard input box is up (front_text_input). The game window is not key then, which is not a focus change the game should see: on hardware the inline keyboard is drawn inside
+@@ -164,6 +175,7 @@ static void on_key(NSEvent *e, int down) {
+ static pad_slots g_slots;
+ static GCController *g_held[DM_PLAYERS];   // the controller of each slot, kept alive while it holds it (the slot table keys on its pointer)
+ static int g_merge, g_kbd_own;
++static NSString *g_player_one_model;
+ static int32_t pad_axis(float v) { return (int32_t)(fmaxf(-1.f, fminf(1.f, v)) * DM_STICK_MAX); }
+ // A controller's state for player p, GameController or raw HID: a pressed button or a stick past 15% hides the pointer (cursor_hide_for_input), a resting stick's drift does not
+ static void pad_set(int p, uint64_t m, int32_t lx, int32_t ly, int32_t rx, int32_t ry) {
+@@ -231,8 +243,25 @@ static void pads_changed(GCController *gone) {
+         pad_slot_free(&g_slots, (__bridge const void *)g_held[p]); g_held[p] = nil;
+         dm_pad_set_player(p, 0, 0, 0, 0, 0);   // nothing stays pressed
+     }
++    GCController *first = nil;
++    if (g_player_one_model && !g_slots.owner[0]) {
++        for (GCController *c in now) {
++            if (c != gone && c.extendedGamepad && [c.vendorName isEqualToString:g_player_one_model] &&
++                pad_slot_of(&g_slots, (__bridge const void *)c) < 0) {
++                first = c;
++                break;
++            }
++        }
++    }
++    if (first) {
++        NSMutableArray<GCController *> *ordered = [now mutableCopy];
++        [ordered removeObjectIdenticalTo:first];
++        [ordered insertObject:first atIndex:0];
++        now = ordered;
++    }
+     for (GCController *c in now) if (c.extendedGamepad && c != gone && pad_slot_of(&g_slots, (__bridge const void *)c) < 0) {
+-        int p = pad_slot_take(&g_slots, (__bridge const void *)c, pad_name(c));
++        int p = c == first ? pad_slot_take_one(&g_slots, (__bridge const void *)c, pad_name(c))
++                           : pad_slot_take(&g_slots, (__bridge const void *)c, pad_name(c));
+         if (p < 0) { LOG("controller '%s' connected: all %d players are taken, not used", pad_name(c), DM_PLAYERS); continue; }
+         g_held[p] = c; pad_keep_system_buttons(c);
+         c.extendedGamepad.valueChangedHandler = ^(GCExtendedGamepad *g, GCControllerElement *el) { (void)el; pad_read(g); };
+@@ -410,6 +439,9 @@ static void hq_close(void) {
+ static void pads_start(void) {
+     const char *e = getenv("DM_PAD_MERGE"); g_merge = e && atoi(e);
+     e = getenv("DM_KBD_PLAYER"); g_kbd_own = !g_merge && e && !strcmp(e, "own");
++    e = getenv("DM_PAD_PLAYER1");
++    if (!g_merge && !g_kbd_own && e && *e && strlen(e) < sizeof g_slots.last[0])
++        g_player_one_model = [NSString stringWithUTF8String:e];
+     static const char kbd = 0;
+     if (g_kbd_own) pad_slot_take(&g_slots, &kbd, "keyboard");   // holds player 1 for good
+     LOG("front end: %s", g_merge ? "every controller is player 1 (DM_PAD_MERGE)" : g_kbd_own ? "the keyboard is player 1, each controller a player of its own from player 2 on (DM_KBD_PLAYER=own)"
+@@ -426,7 +458,9 @@ static void pads_start(void) {
+ // The picture's width / height (front.h front_picture_shape; 16:9 until the first present), which the present fits into the view
+ static _Atomic double g_picture_aspect = 16.0 / 9.0;
+ void front_picture_shape(int w, int h) { if (w > 0 && h > 0) g_picture_aspect = (double)w / h; }
+-@interface DmGameView : NSView @end
++@interface DmGameView : NSView
++- (void)fitDrawable;
++@end
+ @implementation DmGameView
+ - (void)mouseDown:(NSEvent *)e { [self mouseDragged:e]; }
+ - (void)mouseDragged:(NSEvent *)e {
+@@ -1329,7 +1363,8 @@ void front_run(void (*guest)(void)) {
+         // Fullscreen: without FullScreenPrimary the green button only zooms the window. The present path already scales
+         // the game picture to fit the drawable with black bars around it, so fullscreen keeps the game's aspect ratio.
+         win.collectionBehavior = NSWindowCollectionBehaviorFullScreenPrimary;
+-        NSView *v = win.contentView = [[DmGameView alloc] initWithFrame:r];
++        DmGameView *v = [[DmGameView alloc] initWithFrame:r];
++        win.contentView = v;
+         v.wantsLayer = YES;
+         g_layer = [CAMetalLayer layer];
+         g_layer.device = MTLCreateSystemDefaultDevice();
+@@ -1338,7 +1373,7 @@ void front_run(void (*guest)(void)) {
+         // Apple's HUD over the game (frame rate, frame and GPU time, memory): front_hud_env turns it on before the first device. The layer's developerHUDProperties
+         // stay unset: mode=default forces this layer's HUD on, so the Metal HUD menu's Hide HUD left it on screen
+         if (getenv("DM_METAL_HUD") && atoi(getenv("DM_METAL_HUD"))) LOG("front end: Metal performance HUD on (DM_METAL_HUD)");
+-        v.layer = g_layer; [(DmGameView *)v fitDrawable];
++        v.layer = g_layer; [v fitDrawable];
+         [win center];
+         [win makeKeyAndOrderFront:nil];
+         screen_refresh(win.screen ?: NSScreen.mainScreen);
+@@ -1415,12 +1450,11 @@ void front_run(void (*guest)(void)) {
+         // Lifecycle (hle.h / dm.h): focus lost → 2, focus regained → 1; minimized → 3 + audio paused + GPU suspended, restored → resume (followed by focus regained → 1).
+         // Input is released when the window stops being key (and when it is minimized) and taken up again when it is key again
+         NSNotificationCenter *nc = NSNotificationCenter.defaultCenter;
+-        [nc addObserverForName:NSWindowDidChangeScreenNotification object:win queue:nil usingBlock:^(NSNotification *n) { (void)n; screen_refresh(win.screen); if (win.screen) g_layer.contentsScale = win.backingScaleFactor; screen_match_apply(); }];
+-        [nc addObserverForName:NSApplicationDidChangeScreenParametersNotification object:nil queue:nil usingBlock:^(NSNotification *n) { (void)n; screen_refresh(win.screen); }];
+-        // Entering and leaving fullscreen: the layer is layer-backed, so its frame (and with it the drawable) follows the
+-        // content view by itself; only the scale factor has to be carried over to the screen the window ended up on. The screen's rate is matched in fullscreen only (screen_match_apply)
+-        [nc addObserverForName:NSWindowDidEnterFullScreenNotification object:win queue:nil usingBlock:^(NSNotification *n) { (void)n; screen_refresh(win.screen); g_fullscreen = 1; g_layer.contentsScale = win.backingScaleFactor; screen_match_apply(); }];
+-        [nc addObserverForName:NSWindowDidExitFullScreenNotification object:win queue:nil usingBlock:^(NSNotification *n) { (void)n; g_fullscreen = 0; screen_refresh(win.screen); g_layer.contentsScale = win.backingScaleFactor; screen_match_apply(); }];
++        [nc addObserverForName:NSWindowDidChangeScreenNotification object:win queue:nil usingBlock:^(NSNotification *n) { (void)n; screen_refresh(win.screen); [v fitDrawable]; screen_match_apply(); }];
++        [nc addObserverForName:NSApplicationDidChangeScreenParametersNotification object:nil queue:nil usingBlock:^(NSNotification *n) { (void)n; screen_refresh(win.screen); [v fitDrawable]; }];
++        // Refit the drawable after AppKit moves or resizes the window, and match the refresh rate only in fullscreen.
++        [nc addObserverForName:NSWindowDidEnterFullScreenNotification object:win queue:nil usingBlock:^(NSNotification *n) { (void)n; g_fullscreen = 1; screen_refresh(win.screen); [v fitDrawable]; screen_match_apply(); }];
++        [nc addObserverForName:NSWindowDidExitFullScreenNotification object:win queue:nil usingBlock:^(NSNotification *n) { (void)n; g_fullscreen = 0; screen_refresh(win.screen); [v fitDrawable]; screen_match_apply(); }];
+         // DM_FOCUS_KEEP=1 (scripts/regress.py): the game stays in focus while its window is up, whichever app is active. Tears of the Kingdom stops presenting out of focus, so
+         // another app taking the key window during an unattended run read as a hang (no frame after the last focus change)
+         static int keep = -1; if (keep < 0) keep = getenv("DM_FOCUS_KEEP") && atoi(getenv("DM_FOCUS_KEEP"));
+diff --git a/dm/host/pad_slots.h b/dm/host/pad_slots.h
+index fa7058e5..f40ccbd5 100644
+--- a/dm/host/pad_slots.h
++++ b/dm/host/pad_slots.h
+@@ -27,6 +27,13 @@ static int pad_slot_take(pad_slots *s, const void *owner, const char *name) {
+     s->owner[p] = owner; snprintf(s->last[p], sizeof s->last[p], "%s", name);
+     return p;
+ }
++static int pad_slot_take_one(pad_slots *s, const void *owner, const char *name) {
++    int p = pad_slot_of(s, owner);
++    if (p >= 0 || !owner || s->owner[0]) return p;
++    s->owner[0] = owner;
++    snprintf(s->last[0], sizeof s->last[0], "%s", name ? name : "");
++    return 0;
++}
+ static int pad_slot_free(pad_slots *s, const void *owner) {
+     int p = pad_slot_of(s, owner); if (p >= 0) s->owner[p] = NULL;
+     return p;
+diff --git a/dm/host/tests/t_hid.c b/dm/host/tests/t_hid.c
+index 2c8761f8..28f43699 100644
+--- a/dm/host/tests/t_hid.c
++++ b/dm/host/tests/t_hid.c
+@@ -77,6 +77,9 @@ static void t_slots(void) {
+     CHECK(pad_slot_take(&s, NULL, "x") == -1 && pad_slot_free(&s, NULL) == -1, "no owner, no slot");
+     memset(&s, 0, sizeof s);   // DM_KBD_PLAYER=own: the keyboard holds player 1 for good
+     CHECK(pad_slot_take(&s, &kbd, "keyboard") == 0 && pad_slot_take(&s, &a, "Xbox Wireless Controller") == 1, "with the keyboard on its own the first controller is player 2");
++    CHECK(pad_slot_take_one(&s, &b, "DualSense Wireless Controller") == -1, "preferred player 1 cannot displace an active player");
++    CHECK(pad_slot_free(&s, &kbd) == 0 && pad_slot_take_one(&s, &b, "DualSense Wireless Controller") == 0, "preferred controller takes the open player 1 slot");
++    CHECK(pad_slot_take_one(&s, &a, "Xbox Wireless Controller") == 1, "preferred assignment does not move an attached controller");
+ }
+ 
+ static void t_npads(void) {

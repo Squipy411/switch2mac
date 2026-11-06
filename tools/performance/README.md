@@ -1,0 +1,7 @@
+# Mario Kart World performance runtime
+
+`mkw-runtime.patch` applies to nxnative commit `a334797d1292a5eeaa13b46758bf35994217f47f` from [seedds/nxnative](https://github.com/seedds/nxnative). It contains source and tests for the tested M2 scheduling setup, the renderer experiments, and preferred Player 1 controller assignment. Build the host for game ID `0400C3F00006E000` with that checkout's documented build tools. Use only shader libraries that match the host's compiled shader chain.
+
+`tools/portable_game.py pack` accepts `--runtime` and an optional `--performance-module`. The latter requires the matching Mario Kart World 1.0.0 app and a locally prepared module. The tool checks the shader chain and the two permitted instruction changes before including the module. The two patched scene heights are ARM64 `mov w26, #396` at offsets `0xc10300` and `0xc101d8`, replacing `0x1a95b11a` in the verified rewritten module. The original module remains selectable in the exported app.
+
+On the tested M2 Air, interactive scheduling reduced early-race CPU submission time to about 6–7 ms. Five consecutive 300-frame race windows ran at about 60 FPS with no dropped presents. Longer runs showed texture-streaming hitches and lower frame rates. Results vary by course, hardware, display and system load. The optional WaterSurface slice merge passed Metal fixture checks. It requires an in-game performance comparison.

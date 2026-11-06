@@ -203,6 +203,15 @@ def replace_app(tmp, out):
         tmp.rename(out)
 
 
+def portable_bootstrap(path):
+    from importlib.util import module_from_spec, spec_from_file_location
+
+    spec = spec_from_file_location('switch2mac_portable_game', path)
+    module = module_from_spec(spec)
+    spec.loader.exec_module(module)
+    return module
+
+
 def pack(a):
     out = Path(a.out).resolve()
     if out.suffix != '.app': raise SystemExit(f'the output must end in .app: {out}')
@@ -212,7 +221,7 @@ def pack(a):
     except (OSError, ValueError): previous = None
     try:
         a = argparse.Namespace(**vars(a))
-        for name in ('out', 'host', 'patched', 'romfs', 'msl', 'tables', 'font', 'aoc', 'pso', 'pso_pairs', 'env_file', 'settings', 'icon'):
+        for name in ('out', 'host', 'patched', 'romfs', 'msl', 'tables', 'font', 'aoc', 'pso', 'pso_pairs', 'env_file', 'settings', 'icon', 'portable_bootstrap'):
             if getattr(a, name): setattr(a, name, str(Path(getattr(a, name)).resolve()))
         mods, msls, pso, tables, pairs, fonts, files = selected_inputs(a)
         clang = Path(run(['xcrun', '--find', 'clang']).strip()).resolve()
@@ -224,6 +233,9 @@ def pack(a):
         codesign = Path(codesign).resolve()
         minos = min_os(a.host)
         sources = [Path(__file__).resolve(), HERE / 'launcher.c', HERE.parent / 'host/romfs_image.h', HERE.parent / 'host/save_sync.c', HERE.parent / 'host/save_sync.h', HERE.parent / 'tools/romfs.py'] + swift_sources()
+        if a.portable_bootstrap:
+            bootstrap = Path(a.portable_bootstrap)
+            sources += [bootstrap, *sorted((bootstrap.parent / 'portable_launcher').glob('*.*'))]
         inputs = {'options': vars(a), 'files': [(str(p), p.stat().st_mode, digest(p), os.readlink(p) if p.is_symlink() else None) for p in files + sources],
                   'trees': [(p, inventory(Path(p))) for p in (a.romfs, a.aoc) if p],
                   'tools': [[str(c), c.stat().st_mode, c.stat().st_size, c.stat().st_mtime_ns, c.stat().st_ctime_ns, run([c, '--version']).strip()] for c in (clang, swiftc)] + [
@@ -250,7 +262,8 @@ def pack(a):
         free = shutil.disk_usage(res).free
         if need + (1 << 30) > free: raise SystemExit(f'the app needs {need / 2**30:.1f} GB on the volume of {out.parent} (no APFS clones from the build there) and {free / 2**30:.1f} GB are free')
     step(f'launcher and host ({"clones" if clone["romfs"] else "copies"} of the game files)')
-    build_launcher(mac / EXE, minos, clang, swiftc, sdk)
+    if not a.portable_bootstrap:
+        build_launcher(mac / EXE, minos, clang, swiftc, sdk)
     shutil.copy2(a.host, mac / 'dmhost')
     copy(mods, dm, clone['mods'])
     if tables: copy(tables, dm, False)
@@ -271,7 +284,12 @@ def pack(a):
     if msl_dst.name.startswith('b-'): info['DMChain'] = msl_dst.name[2:]   # the library chain the app carries (a Vulkan or GL game's vk / gl has none)
     (c / 'Info.plist').write_bytes(plistlib.dumps(info))
     (c / 'PkgInfo').write_text('APPL????')
+    if a.portable_bootstrap:
+        step('portable launcher')
+        portable_bootstrap(a.portable_bootstrap).install_bootstrap(tmp, info)
     step(f'signing ({"ad-hoc" if a.sign == "-" else a.sign})'); sign(tmp, a.sign, codesign)
+    if a.portable_bootstrap:
+        run([mac / 'switch2mac-portable', '--check'])
     had_old = out.exists()
     replace_app(tmp, out)
     key_tmp = key_file.with_name(key_file.name + '.partial')
@@ -307,6 +325,7 @@ def parse(argv):
     ap.add_argument('--version'); ap.add_argument('--bundle-id'); ap.add_argument('--category'); ap.add_argument('--lang'); ap.add_argument('--marker', help='the profile\'s romfs_marker')
     ap.add_argument('--icon', help='the game icon (icon.jpg from the control data)')
     ap.add_argument('--launcher-window', choices=('on', 'off'), default='on', help='off: no settings window before the game (Info.plist DMLauncherWindow)')
+    ap.add_argument('--portable-bootstrap', help='Switch2Mac portable bundle bootstrap to install before signing')
     ap.add_argument('--sign', default='-', help='codesign identity (default: - = ad-hoc)')
     return ap.parse_args(argv)
 
